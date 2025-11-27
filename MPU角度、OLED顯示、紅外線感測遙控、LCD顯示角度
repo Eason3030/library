@@ -1,0 +1,319 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <LiquidCrystal_PCF8574.h>
+
+// ---------- OLED ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---------- LCD ----------
+LiquidCrystal_PCF8574 lcd(0x27);
+
+// ---------- MPU6050 ----------
+#define MPU_6050 0x68
+#define PWR_MGMT_1 0x6B
+#define ACCEL_XOUT_H 0x3B
+#define GYRO_XOUT_H  0x43
+
+// ---------- PIN ----------
+const int BUZZER_PIN = 8;
+const int RELAY_PIN  = 11;
+const int REMOTE_PIN = 3;
+
+// ---------- IMU ----------
+float dt = 0.01f;
+const float alpha = 0.98f;
+float compAngleX = 0.0f; 
+float gyroBiasX = 0.0f;
+float accelBiasX = 0.0f;
+
+// ---------- 狀態 ----------
+bool wheelDown = false;
+bool lastRemoteRead = false;
+unsigned long wheelAnimationStartTime = 0;
+bool showWheelAnimation = false;
+
+// ---------- 調試 ----------
+unsigned long lastPrintTime = 0;
+
+// 前向聲明
+void showStartupScreen();
+void showSystemStatus(bool wheelDown);
+void updateLCD(float angle);
+void moduleTestScreen();
+
+// =====================================================================
+// MPU 基本讀取
+// =====================================================================
+void mpuReadBytes(uint8_t reg, uint8_t count, uint8_t* dest) {
+  Wire.beginTransmission(MPU_6050);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)MPU_6050, (uint8_t)count);
+  for (uint8_t i = 0; i < count; i++) dest[i] = Wire.read();
+}
+
+int16_t read16(uint8_t reg) {
+  uint8_t buf[2];
+  mpuReadBytes(reg, 2, buf);
+  return (int16_t)((buf[0] << 8) | buf[1]);
+}
+
+void setupMPU() {
+  Wire.beginTransmission(MPU_6050);
+  Wire.write(PWR_MGMT_1);
+  Wire.write(0x00);
+  Wire.endTransmission();
+  delay(50);
+}
+
+void calibrateIMU(unsigned int samples = 200) {
+  float sumAx = 0.0f, sumGx = 0.0f;
+  for (unsigned int i = 0; i < samples; ++i) {
+    int16_t rawAx = read16(ACCEL_XOUT_H);
+    int16_t rawGx = read16(GYRO_XOUT_H);
+    sumAx += rawAx / 16384.0f;
+    sumGx += rawGx / 131.0f;
+    delay(5);
+  }
+  accelBiasX = sumAx / samples;
+  gyroBiasX  = sumGx / samples;
+}
+
+void readIMU(float &ax_g, float &ay_g, float &az_g, float &gx_dps, float &gy_dps, float &gz_dps) {
+  int16_t rawAx = read16(ACCEL_XOUT_H);
+  int16_t rawAy = read16(ACCEL_XOUT_H + 2);
+  int16_t rawAz = read16(ACCEL_XOUT_H + 4);
+  int16_t rawGx = read16(GYRO_XOUT_H);
+  int16_t rawGy = read16(GYRO_XOUT_H + 2);
+  int16_t rawGz = read16(GYRO_XOUT_H + 4);
+
+  ax_g = rawAx / 16384.0f;
+  ay_g = rawAy / 16384.0f;
+  az_g = rawAz / 16384.0f;
+  gx_dps = rawGx / 131.0f;
+  gy_dps = rawGy / 131.0f;
+  gz_dps = rawGz / 131.0f;
+}
+
+// =====================================================================
+// OLED 啟動畫面（跑馬燈）
+// =====================================================================
+void showStartupScreen() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(15, 10);
+  display.print("System");
+  display.setTextSize(1);
+  display.setCursor(28, 30);
+  display.print("Starting...");
+
+  const int barX = 10, barY = 50, barW = 108, barH = 8;
+
+  for (int p = 0; p <= barW; p += 4) {
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(15, 10);
+    display.print("System");
+    display.setTextSize(1);
+    display.setCursor(28, 30);
+    display.print("Starting...");
+
+    display.drawRect(barX, barY, barW, barH, SSD1306_WHITE);
+    display.fillRect(barX, barY, p, barH, SSD1306_WHITE);
+    display.display();
+    delay(40);
+  }
+  delay(300);
+}
+
+// =====================================================================
+// OLED 主畫面：顯示狀態
+// =====================================================================
+void showSystemStatus(bool wheelDown) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(20, 0);
+  display.print("STATUS");
+
+  display.setTextSize(1);
+  display.setCursor(10, 20);
+  display.print("Wheel:");
+  
+  // 顯示動畫效果
+  if (showWheelAnimation) {
+    unsigned long elapsed = millis() - wheelAnimationStartTime;
+    int animFrame = (elapsed / 100) % 5;
+    
+    display.setTextSize(2);
+    display.setCursor(30, 32);
+    
+    if (wheelDown) {
+      // 下降動畫
+      const char* frames[] = {"|", "V", "v", "v", "v"};
+      display.print(frames[animFrame]);
+      display.print(" DOWN");
+    } else {
+      // 上升動畫
+      const char* frames[] = {"|", "^", "^", "^", "^"};
+      display.print(frames[animFrame]);
+      display.print(" UP");
+    }
+    
+    // 動畫持續 800ms
+    if (elapsed > 800) {
+      showWheelAnimation = false;
+    }
+  } else {
+    // 靜態顯示
+    display.setTextSize(2);
+    display.setCursor(30, 32);
+    if (wheelDown) {
+      display.print("v DOWN");
+    } else {
+      display.print("^ UP");
+    }
+  }
+
+  display.display();
+}
+
+// =====================================================================
+// LCD 顯示角度
+// =====================================================================
+void updateLCD(float angle) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Angle: ");
+  lcd.print(angle, 1);
+}
+
+// =====================================================================
+// 模組測試畫面
+// =====================================================================
+void moduleTestScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print("MODULE TEST");
+  
+  display.setCursor(0, 15);
+  display.print("OLED: OK");
+  
+  display.setCursor(0, 25);
+  display.print("LCD: OK");
+  
+  display.setCursor(0, 35);
+  display.print("MPU: OK");
+  
+  display.setCursor(0, 45);
+  display.print("RELAY: TEST");
+  
+  display.display();
+  
+  // 測試繼電器
+  digitalWrite(RELAY_PIN, HIGH);
+  delay(1000);
+  digitalWrite(RELAY_PIN, LOW);
+  
+  // 測試蜂鳴器
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(200);
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  // LCD 測試
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("TEST COMPLETE");
+  delay(1000);
+}
+
+// =====================================================================
+// Setup
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Wire.begin();
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(REMOTE_PIN, INPUT);
+  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED Init Failed!");
+    while (1);
+  }
+
+  // LCD
+  lcd.begin(16, 2);
+  lcd.setBacklight(1);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Initializing...");
+
+  // MPU
+  setupMPU();
+  calibrateIMU();
+  Serial.println("MPU OK");
+
+  delay(500);
+  
+  // 啟動畫面
+  showStartupScreen();
+  
+  // 模組測試
+  moduleTestScreen();
+  
+  lcd.clear();
+}
+
+// =====================================================================
+// Loop
+// =====================================================================
+void loop() {
+  float ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps;
+  readIMU(ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps);
+
+  gx_dps -= gyroBiasX;
+  ax_g -= accelBiasX;
+
+  float accelAngle = atan2(ax_g, az_g) * 180 / PI;
+  compAngleX = alpha * (compAngleX + gx_dps * dt) + (1 - alpha) * accelAngle;
+
+  // 遙控切換輔助輪
+  int r = digitalRead(REMOTE_PIN);
+  if (r == HIGH && lastRemoteRead == LOW) {
+    wheelDown = !wheelDown;
+    digitalWrite(RELAY_PIN, wheelDown ? HIGH : LOW);
+    
+    // 啟動動畫
+    showWheelAnimation = true;
+    wheelAnimationStartTime = millis();
+  }
+  lastRemoteRead = r;
+
+  // 顯示
+  showSystemStatus(wheelDown);
+  updateLCD(compAngleX);
+
+  // Serial 調試
+  if (millis() - lastPrintTime > 500) {
+    Serial.print("Angle: ");
+    Serial.print(compAngleX);
+    Serial.print(" | Wheel: ");
+    Serial.println(wheelDown ? "DOWN" : "UP");
+    lastPrintTime = millis();
+  }
+
+  delay(20);
+}
