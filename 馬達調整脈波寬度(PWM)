@@ -1,37 +1,39 @@
-// --- 引腳定義 ---
-// D9 是我們連接到 XY-MOS 模組 TRIG/PWM 輸入的 PWM 輸出引腳
-const int pwmControlPin = 9;
-
-// A0 是我們連接電位器中間引腳的類比輸入引腳
-const int speedPotPin = A0;
-
-// --- 變數 ---
-int motorSpeed = 0; // 用於儲存計算出的 PWM 速度值 (0-255)
+// 定義腳位
+const int hallSensorPin = 2; // 霍爾感測器連接到 Arduino 數位腳位 D2
+const int relayPin = 1;      // 繼電器連接到 Arduino 數位腳位 D3
 
 void setup() {
-  // 將 PWM 控制引腳設定為輸出模式
-  pinMode(pwmControlPin, OUTPUT);
+  // 設定霍爾感測器為輸入模式
+  pinMode(hallSensorPin, INPUT);
+  
+  // 設定繼電器為輸出模式
+  pinMode(relayPin, OUTPUT);
 
-  // 啟用序列埠通訊，設置鮑率 (baud rate) 為 9600
-  Serial.begin(9600); 
+  // 程式開始時，確保繼電器是關閉的 (通常是輸出 HIGH 關閉)
+  // 如果是低電位觸發的繼電器，輸出 HIGH 會讓它保持在非作動狀態
+  digitalWrite(relayPin, HIGH);
+  
+  Serial.begin(9600);
+  Serial.println("霍爾感測器繼電器控制啟動...");
 }
 
 void loop() {
-  // Step 1: 讀取電位器的類比訊號值 (0 到 1023)
-  int potValue = analogRead(speedPotPin);
+  // 讀取霍爾感測器的狀態
+  // 數位霍爾感測器在偵測到磁場時通常會輸出 LOW (0)
+  int hallState = digitalRead(hallSensorPin);
+  
+  // 判斷是否偵測到磁場
+  if (hallState == LOW) {
+    // **偵測到磁場：啟動繼電器**
+    // 對於低電位觸發的繼電器模組，輸出 LOW 會啟動繼電器
+    digitalWrite(relayPin, LOW); 
+    Serial.println("-> 磁場偵測到！繼電器作動 (負載開啟)。");
+  } else {
+    // **未偵測到磁場：關閉繼電器**
+    // 對於低電位觸發的繼電器模組，輸出 HIGH 會關閉繼電器
+    digitalWrite(relayPin, HIGH); 
+    Serial.println("-> 未偵測到磁場。繼電器釋放 (負載關閉)。");
+  }
 
-  // Step 2: 將讀取範圍轉換/映射到 PWM 輸出範圍 (0 到 255)
-  motorSpeed = map(potValue, 0, 1023, 0, 128);
-
-  // Step 3: 使用 analogWrite() 將 PWM 訊號發送到 XY-MOS 模組
-  analogWrite(pwmControlPin, motorSpeed);
-
-  // Step 4: 列印速度值以進行偵錯到序列埠監視器
-  Serial.print("Potentiometer Value: ");
-  Serial.print(potValue);
-  Serial.print(" | PWM Speed (0-255): ");
-  Serial.println(motorSpeed); // println 在列印完畢後換行
-
-  // 稍作延遲，防止類比讀數過快填滿序列埠緩衝區
-  delay(50); // 將延遲增加到 50ms，以使序列埠輸出更易於閱讀
+  delay(100); // 稍微延遲一下，避免讀取速度太快
 }
