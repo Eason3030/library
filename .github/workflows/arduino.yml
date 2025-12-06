@@ -1,0 +1,22 @@
+name: Arduino CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  compile-sketch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compile Arduino sketch
+        uses: arduino/compile-sketches@v1
+        with:
+          fqbn: "arduino:avr:uno"   # 依你的板子調整
+          sketch-paths: |
+            .                        # 專案根目錄
