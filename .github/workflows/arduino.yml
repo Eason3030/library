@@ -7,16 +7,16 @@ on:
     branches: [ "main" ]
 
 jobs:
-  compile-sketch:
+  compile:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Compile Arduino sketch
+      - name: Compile Arduino sketches
         uses: arduino/compile-sketches@v1
         with:
-          fqbn: "arduino:avr:uno"   # 依你的板子調整
+          fqbn: "arduino:avr:uno"
           sketch-paths: |
-            .                        # 專案根目錄
+            .
