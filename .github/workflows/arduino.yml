@@ -28,4 +28,4 @@ jobs:
       # 4️⃣ 編譯你的 sketch
       - name: Compile library sketch
         run: |
-          arduino-cli compile --fqbn arduino:avr:uno library
+arduino-cli compile --fqbn arduino:avr:uno library_v3
