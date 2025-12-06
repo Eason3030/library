@@ -1,4 +1,4 @@
-name: Arduino build
+name: Arduino Uno Build
 
 on:
   push:
@@ -12,16 +12,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1️⃣ 先把你的程式碼抓下來
       - uses: actions/checkout@v4
 
+      # 2️⃣ 安裝 Arduino CLI
       - name: Install Arduino CLI
-        uses: arduino/setup-arduino-cli@v2   # 讓 CI 環境安裝 Arduino CLI  [oai_citation:2‡GitHub](https://github.com/arduino/setup-arduino-cli?utm_source=chatgpt.com)
+        uses: arduino/setup-arduino-cli@v2
 
-      - name: Install AVR core for Uno
+      # 3️⃣ 安裝 Arduino AVR 核心 (支援 Uno)
+      - name: Install AVR core
         run: |
           arduino-cli core update-index
           arduino-cli core install arduino:avr
 
-      - name: Compile sketch
-        # 假設你的主要 sketch 放在根目錄並叫做 main.ino，或放在例如 src/ 內
-        run: arduino-cli compile --fqbn arduino:avr:uno path/to/your/sketch_folder
+      # 4️⃣ 編譯你的 sketch
+      - name: Compile library sketch
+        run: |
+          arduino-cli compile --fqbn arduino:avr:uno library
