@@ -649,99 +649,75 @@ void loop() {
   float ax, gx;
   readIMU(ax, gx);
 
-  // 速度測量
+  // 速度測量更新
   if (newSpeedData) {
     currentSpeed = calculateSpeed();
     newSpeedData = false;
     lastSpeedUpdate = millis();
   }
 
+  // 速度超時歸零
   if (millis() - lastSpeedUpdate > SPEED_TIMEOUT) {
     currentSpeed = 0.0;
   }
 
   // 紅外線遙控接收
-   if (IrReceiver.decode()) {
+  if (IrReceiver.decode()) {
     uint32_t code = IrReceiver.decodedIRData.decodedRawData;
     Serial.print("IR Received: 0x");
     Serial.println(code, HEX);
-    handleIRCommand(code);  // 處理紅外線指令
-    IrReceiver.resume();    // 讓接收器準備好接收下一個信號
+    handleIRCommand(code);  // 會切換 wheelDown 並設 manualMode = true
+    IrReceiver.resume();
   }
 
-  // 顯示更新
-  if (millis() - lastDisplayTime > 50) {
-    showStatus();  // 更新顯示
-    lastDisplayTime = millis();
-  }
-
-  // 序列埠輸出
-  if (millis() - lastPrintTime > 500) {
-    Serial.print("Wheel: ");
-    Serial.println(wheelDown ? "DOWN" : "UP");
-    lastPrintTime = millis();
-  }
-
-  delay(20);
-}
-
-  // 速度自動控制
+  // === 自動模式控制（僅在非手動模式下生效）===
   if (!manualMode) {
     bool shouldWheelDown = (currentSpeed < SPEED_THRESHOLD);
 
     if (shouldWheelDown != wheelDown) {
       wheelDown = shouldWheelDown;
-      ctrlSrc = 3;
+      ctrlSrc = 3;  // AUTO
       digitalWrite(RELAY_PIN, wheelDown ? HIGH : LOW);
 
-      if (wheelDown) {
-        soundDown();
-      } else {
-        soundUp();
-      }
+      if (wheelDown) soundDown();
+      else soundUp();
 
       showWheelAnim = true;
       wheelAnimStartTime = millis();
 
       Serial.print("AUTO: Speed ");
-      Serial.print(currentSpeed);
+      Serial.print(currentSpeed, 1);
       Serial.print(" -> Wheel ");
       Serial.println(wheelDown ? "DOWN" : "UP");
     }
   }
 
-  // 霍爾感測器手動控制
+  // === 霍爾感測器手動控制（優先級高於自動）===
   int hall = digitalRead(HALL_SENSOR_PIN);
   if (hall != lastHallState) {
+    lastHallState = hall;
     wheelDown = (hall == LOW);
-    ctrlSrc = 1;
+    ctrlSrc = 1;  // HALL
     manualMode = true;
 
     digitalWrite(RELAY_PIN, wheelDown ? HIGH : LOW);
-    digitalWrite(LED_HALL, HIGH);
 
-    if (wheelDown) {
-      soundDown();
-    } else {
-      soundUp();
-    }
-
-    digitalWrite(LED_HALL, LOW);
+    if (wheelDown) soundDown();
+    else soundUp();
 
     showWheelAnim = true;
     wheelAnimStartTime = millis();
-    lastHallState = hall;
 
-    Serial.println("HALL: Manual control");
+    Serial.println("HALL: Manual control activated");
   }
 
-  // 顯示更新
+  // === OLED 顯示更新 ===
   if (millis() - lastDisplayTime > 50) {
     showStatus();
     lastDisplayTime = millis();
   }
 
-  // 序列埠輸出
+  // === 序列埠詳細資訊輸出 ===
   if (millis() - lastPrintTime > 500) {
     Serial.print("Speed: ");
     Serial.print(currentSpeed, 1);
@@ -750,9 +726,15 @@ void loop() {
     Serial.print("° | Wheel: ");
     Serial.print(wheelDown ? "DOWN" : "UP");
     Serial.print(" | Mode: ");
-    Serial.println(manualMode ? "MANUAL" : "AUTO");
+    Serial.print(manualMode ? "MANUAL" : "AUTO");
+    Serial.print(" | Ctrl: ");
+    if (ctrlSrc == 1) Serial.print("HALL");
+    else if (ctrlSrc == 2) Serial.print("IR");
+    else if (ctrlSrc == 3) Serial.print("AUTO");
+    else Serial.print("INIT");
+    Serial.println();
     lastPrintTime = millis();
   }
 
-  delay(20);
+  delay(10);  // 可略微縮短延遲以提升反應速度
 }
