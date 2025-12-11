@@ -1,47 +1,84 @@
-# Adafruit GFX Library ![Build Status](https://github.com/adafruit/Adafruit-GFX-Library/workflows/Arduino%20Library%20CI/badge.svg)
+# 自行車輔助輪控制系統
 
-This is the core graphics library for all our displays, providing a common set of graphics primitives (points, lines, circles, etc.). It needs to be paired with a hardware-specific library for each display device we carry (to handle the lower-level functions).
-
-Adafruit invests time and resources providing this open source code, please support Adafruit and open-source hardware by purchasing products from Adafruit!
-
-Written by Limor Fried/Ladyada for Adafruit Industries.
-BSD license, check license.txt for more information.
-All text above must be included in any redistribution.
-
-Recent Arduino IDE releases include the Library Manager for easy installation. Otherwise, to download, click the DOWNLOAD ZIP button, uncompress and rename the uncompressed folder Adafruit_GFX. Confirm that the Adafruit_GFX folder contains Adafruit_GFX.cpp and Adafruit_GFX.h. Place the Adafruit_GFX library folder your ArduinoSketchFolder/Libraries/ folder. You may need to create the Libraries subfolder if its your first library. Restart the IDE.
-
-**You will also need to install the latest Adafruit BusIO library.** Search for "Adafruit BusIO" in the library manager, or install by hand from https://github.com/adafruit/Adafruit_BusIO
-
-# Useful Resources
-
-- Image2Code: This is a handy Java GUI utility to convert a BMP file into the array code necessary to display the image with the drawBitmap function. Check out the code at ehubin's GitHub repository: https://github.com/ehubin/Adafruit-GFX-Library/tree/master/Img2Code
-
-- drawXBitmap function: You can use the GIMP photo editor to save a .xbm file and use the array saved in the file to draw a bitmap with the drawXBitmap function. See the pull request here for more details: https://github.com/adafruit/Adafruit-GFX-Library/pull/31
-
-- 'Fonts' folder contains bitmap fonts for use with recent (1.1 and later) Adafruit_GFX. To use a font in your Arduino sketch, \#include the corresponding .h file and pass address of GFXfont struct to setFont(). Pass NULL to revert to 'classic' fixed-space bitmap font.
-
-- 'fontconvert' folder contains a command-line tool for converting TTF fonts to Adafruit_GFX header format.
-
-- You can also use [this GFX Font Customiser tool](https://github.com/tchapi/Adafruit-GFX-Font-Customiser) (_web version [here](https://tchapi.github.io/Adafruit-GFX-Font-Customiser/)_) to customize or correct the output from [fontconvert](https://github.com/adafruit/Adafruit-GFX-Library/tree/master/fontconvert), and create fonts with only a subset of characters to optimize size.
+## 專案概述
+本專案為一套自行車輔助輪控制系統，整合紅外線遙控、霍爾感測器、速度感測與 MPU6050 陀螺儀，並搭配 OLED 顯示、RGB LED 狀態提示及音效反饋，以提升自行車行駛安全性與互動體驗。
 
 ---
 
-### Roadmap
+## 系統功能
 
-The PRIME DIRECTIVE is to maintain backward compatibility with existing Arduino sketches -- many are hosted elsewhere and don't track changes here, some are in print and can never be changed! This "little" library has grown organically over time and sometimes we paint ourselves into a design corner and just have to live with it or add progressively more ungainly workarounds.
+### 1. 輔助輪控制
+- **手動模式**
+  - **紅外線遙控**：按下遙控器切換 UP/DOWN 狀態。
+  - **霍爾感測器**：感測按壓自動控制輔助輪。
+  - **RGB LED 指示**：DOWN 顯示黃色，UP 顯示綠色。
+  - **音效提示**：放下或收起輔助輪時播放不同音階。
+- **自動模式**
+  - 速度低於 10 km/h 時自動放下輔助輪。
+  - 速度高於 10 km/h 時自動收起輔助輪。
+  - 對應 RGB LED：低速黃色，高速綠色。
+- **傾斜警告**
+  - 當傾斜角度超過 20° 且持續 0.5 秒，自動放下輔助輪，RGB LED 顯示藍色。
+  - 當角度低於 12° 並持續 3 秒，自動收起輔助輪，RGB LED 變回綠色。
+  - 發出音效提示。
+- **緊急停止**
+  - 當角度超過 35°，立即鎖定輔助輪 DOWN，RGB LED 顯示紅色並播放警告音。
+  - 當角度低於 12°，解除緊急狀態。
 
-**We are grateful for everyone's contributions, but pull requests for the following will NOT be merged:**
+---
 
-- Additional or incompatible font formats (see Prime Directive above). There are already two formats and the code is quite bloaty there as it is. This also creates liabilities for tools and documentation. What's there isn't perfect but it does the job.
+### 2. 感測與控制模組
+- **MPU6050**：讀取加速度與陀螺儀數據，計算傾斜角度。
+- **霍爾感測器**：檢測手動操作。
+- **速度感測**：透過霍爾輪速計算即時速度。
+- **紅外線接收器**：接收遙控指令切換輔助輪狀態。
 
-- Additional or incompatible bitmap formats, for similar reasons. It's getting messy.
+---
 
-- Adding background color to custom fonts to erase prior screen contents. The ONLY acceptable methods are to clear the area with a filled rect, or (to avoid flicker) draw text into a GFXcanvas1 and copy to screen with drawBitmap() w/background color. This is on purpose and by design. We've discussed this. Glyphs can overlap.
+### 3. 顯示與互動
+- **OLED 顯示器**：
+  - 顯示系統狀態、輔助輪 UP/DOWN、即時速度及傾斜角度。
+  - 提供啟動畫面與測試動畫。
+- **RGB LED**：
+  - 透過不同顏色顯示系統狀態（紅、藍、黃、綠、紫、關閉）。
+- **音效提示**：
+  - 系統啟動、輔助輪切換、緊急警告及完成操作皆有音效反饋。
 
-- Scrolling, whether hardware- or software-based. Such implementations tend to rely on hardware-specific features (not universally available), read access to the screen's framebuffer (ditto) and/or the addition of virtual functions in GFX which them must be added in *every* subclass, of which there are many. The GFX API is largely "set" at this point and this is just a limitation we live with now.
+---
 
-- Please don't reformat code for the sake of reformatting code. The resulting large "visual diff" makes it impossible to untangle actual bug fixes from merely rearranged lines. clang-format will be the final arbiter.
+### 4. 測試功能
+- OLED 顯示、紅外線、MPU6050、霍爾感測器、速度感測器模組測試。
+- RGB LED 與音效確認。
+- 每個模組測試結果會在 OLED 顯示及音效反饋中呈現。
 
-- Please no more pentagram-drawing PRs. Any oddly-specific drawing functions can go in your own code and aren't helpful in a library context.
+---
 
-If you *must* have one of these features, consider creating a fork with the features required for your project...it's easy to keep synced with the upstream code.
+### 5. 開發進度
+- 系統整合：紅外線、霍爾、速度、MPU6050
+- OLED 顯示與動畫完成
+- RGB LED 顏色對應邏輯完成
+- 音效功能完成
+- 模組測試功能完成
+- 非阻塞優化（延遲替換，提升反應速度）
+
+---
+
+### 6. 未來優化方向
+- 將 `beep()` 和動畫延遲改為非阻塞方式，提高緊急狀態與傾斜反應即時性。
+- 加入數據紀錄功能，可將速度與傾斜角度存檔。
+- 優化 OLED 顯示界面，使動畫與資訊更流暢。
+```mermaid
+graph TD
+    A[系統啟動] --> B[OLED 啟動畫面與自我檢測]
+    B --> C[進入主迴圈]
+    C --> D[讀取 MPU6050 傾斜角度]
+    C --> E[讀取霍爾速度]
+    C --> F[讀取 IR 遙控]
+    C --> G[顯示 OLED 狀態]
+    C --> H[RGB LED 狀態提示]
+    D -->|角度過大| I[輔助輪自動下降/警告]
+    E -->|速度低於門檻| J[輔助輪自動下降]
+    F -->|手動切換| K[輔助輪 UP/DOWN]
+    I --> G
+    J --> G
+    K --> G
