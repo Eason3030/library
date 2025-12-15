@@ -1,6 +1,6 @@
 // ============================================================================
-// 自行車輔助輪智能控制系統 v3.1 - 速度控制修正版
-// 修正：速度觸發邏輯、緊急按鈕、優先權調整、除錯輸出增強
+// 自行車輔助輪智能控制系統 v3 - 完整修正版
+// 修正：雙霍爾感測器、緊急停止按鈕、記憶體優化
 // ============================================================================
 
 #include <Wire.h>
@@ -46,7 +46,6 @@ const byte HALL_SPEED_PIN = 2;       // 速度霍爾
 const byte EMERGENCY_STOP_PIN = 12;  // 緊急停止按鈕
 const byte PWM_CONTROL_PIN = 9;
 const byte SPEED_POT_PIN = A0;
-
 // ============================================================================
 // RGB LED 腳位定義
 // ============================================================================
@@ -79,17 +78,15 @@ uint32_t pwmPreviousMillis = 0;
 bool pwmState = false;
 
 // ============================================================================
-// 速度測量（修正版）
+// 速度測量（使用常數減少 SRAM）
 // ============================================================================
-#define WHEEL_CIRCUMFERENCE 204.2  // 65 * 3.14159 (單位：公分)
-const float SPEED_THRESHOLD = 10.0;        // 速度閾值（km/h）
-const uint16_t SPEED_TIMEOUT = 2000;       // 速度超時（毫秒）
+#define WHEEL_CIRCUMFERENCE 204.2  // 65 * 3.14159
+const float SPEED_THRESHOLD = 10.0;
+const uint16_t SPEED_TIMEOUT = 2000;
 
 volatile uint32_t lastSpeedTrigger = 0;
 volatile uint32_t timeBetweenTriggers = 0;
 volatile bool newSpeedData = false;
-volatile uint32_t speedPulseCount = 0;     // 【新增】脈衝計數
-
 float currentSpeed = 0.0;
 uint32_t lastSpeedUpdate = 0;
 
@@ -126,8 +123,8 @@ const uint16_t RESTART_DELAY_MS = 5000;
 // 霍爾停止邏輯（雙霍爾感測器）
 // ============================================================================
 bool hallStopLocked = false;
-byte lastHallStopUpState = HIGH;
-byte lastHallStopDownState = HIGH;
+byte lastHallStopUpState = HIGH;     // 上升端點狀態
+byte lastHallStopDownState = HIGH;   // 下降端點狀態
 
 // ============================================================================
 // 控制變數
@@ -152,10 +149,12 @@ const uint16_t IR_DELAY = 500;
 // ============================================================================
 void setRGB(byte r, byte g, byte b) {
   if (RGB_COMMON_ANODE) {
+    // 共陽極：反轉邏輯
     analogWrite(RGB_RED_PIN, 255 - r);
     analogWrite(RGB_GREEN_PIN, 255 - g);
     analogWrite(RGB_BLUE_PIN, 255 - b);
   } else {
+    // 共陰極：正常邏輯
     analogWrite(RGB_RED_PIN, r);
     analogWrite(RGB_GREEN_PIN, g);
     analogWrite(RGB_BLUE_PIN, b);
@@ -174,7 +173,7 @@ void setRGBColor(RGBColor c) {
 }
 
 // ============================================================================
-// 音效函式
+// 音效函式（簡化版）
 // ============================================================================
 void beep(uint16_t freq, byte duration) {
   tone(BUZZER_PIN, freq, duration);
@@ -213,27 +212,24 @@ void soundEmergency() {
 }
 
 // ============================================================================
-// 速度中斷（修正版 - 降低防彈跳時間）
+// 速度中斷
 // ============================================================================
 void speedInterrupt() {
   uint32_t t = micros();
-  // 【修正】降低防彈跳時間到 10ms，避免漏掉快速脈衝
-  if (t - lastSpeedTrigger > 10000) {
+  if (t - lastSpeedTrigger > 50000) {
     timeBetweenTriggers = t - lastSpeedTrigger;
     lastSpeedTrigger = t;
     newSpeedData = true;
-    speedPulseCount++;  // 脈衝計數
   }
 }
 
 // ============================================================================
-// 速度計算
+// 速度計算（優化浮點運算）
 // ============================================================================
 float calculateSpeed() {
   if (timeBetweenTriggers == 0) return 0.0;
   float timeInSec = timeBetweenTriggers / 1000000.0;
-  // 公式：(輪周長 cm / 100) / 時間(秒) * 3.6 = km/h
-  return (WHEEL_CIRCUMFERENCE / 100.0 / timeInSec) * 3.6;
+  return (WHEEL_CIRCUMFERENCE / timeInSec) * 0.036;
 }
 
 // ============================================================================
@@ -279,11 +275,12 @@ void readIMU(float &ax, float &gx) {
 }
 
 // ============================================================================
-// 啟動動畫
+// 啟動動畫（簡化版）
 // ============================================================================
 void showStartup() {
   display.clearDisplay();
   
+  // 閃爍標題
   for (byte i = 0; i < 2; i++) {
     display.fillRect(0, 0, 128, 32, SSD1306_WHITE);
     display.setTextColor(SSD1306_BLACK);
@@ -298,6 +295,7 @@ void showStartup() {
     delay(150);
   }
   
+  // 載入條
   display.clearDisplay();
   display.setTextSize(1);
   display.setCursor(28, 8);
@@ -313,7 +311,7 @@ void showStartup() {
 }
 
 // ============================================================================
-// OLED 主畫面
+// OLED 主畫面（優化版）
 // ============================================================================
 void showStatus() {
   display.clearDisplay();
@@ -322,6 +320,7 @@ void showStatus() {
   display.setTextSize(1);
   display.setCursor(4, 3);
   
+  // 狀態顯示（使用 F() 節省 SRAM）
   if (emergencyStop) {
     display.print(F("EMERG"));
   } else if (currentSystemState == HALTED) {
@@ -330,8 +329,6 @@ void showStatus() {
     display.print(F("COOL"));
   } else if (hallStopLocked) {
     display.print(F("LOCK"));
-  } else if (manualMode) {
-    display.print(F("MAN"));
   } else if (ctrlSrc == 1) {
     display.print(F("HALL"));
   } else if (ctrlSrc == 2) {
@@ -344,6 +341,7 @@ void showStatus() {
     display.print(F("RUN"));
   }
   
+  // 速度和角度
   display.print(F(" "));
   display.print((int)currentSpeed);
   display.print(F("k "));
@@ -352,6 +350,7 @@ void showStatus() {
   display.print(angle);
   display.print(F("d"));
   
+  // 警告標示
   if (emergencyStop || current_A > BUZZER_CURRENT_THRESHOLD) {
     display.setCursor(114, 3);
     display.print(F("!!"));
@@ -362,6 +361,7 @@ void showStatus() {
   
   display.setTextSize(2);
   
+  // 輔助輪狀態
   if (showWheelAnim && (millis() - wheelAnimStartTime < 600)) {
     byte frame = ((millis() - wheelAnimStartTime) / 150) % 2;
     
@@ -402,16 +402,11 @@ void handleIRCommand(uint32_t code) {
     
     if (hallStopLocked) {
       hallStopLocked = false;
-      Serial.println(F("IR unlock hall"));
+      Serial.println(F("IR unlock"));
     }
     
-    if (manualMode) {
-      wheelDown = !wheelDown;
-    } else {
-      manualMode = true;
-      wheelDown = !wheelDown;
-    }
-    
+    wheelDown = !wheelDown;
+    manualMode = true;
     ctrlSrc = 2;
     
     beep(NOTE_A5, 40);
@@ -421,9 +416,6 @@ void handleIRCommand(uint32_t code) {
     
     showWheelAnim = true;
     wheelAnimStartTime = millis();
-    
-    Serial.print(F("IR: "));
-    Serial.println(manualMode ? F("Manual") : F("Auto"));
   }
 }
 
@@ -436,12 +428,14 @@ void setup() {
   
   Wire.begin();
   
+  // 腳位初始化
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(RELAY_PIN, OUTPUT);
-  pinMode(HALL_STOP_UP_PIN, INPUT_PULLUP);
-  pinMode(HALL_STOP_DOWN_PIN, INPUT_PULLUP);
+  pinMode(HALL_STOP_UP_PIN, INPUT_PULLUP);     // 上升端點霍爾
+  pinMode(HALL_STOP_DOWN_PIN, INPUT_PULLUP);   // 下降端點霍爾
   pinMode(HALL_SPEED_PIN, INPUT_PULLUP);
-  pinMode(EMERGENCY_STOP_PIN, INPUT_PULLUP);  // 【修正】改為 INPUT_PULLUP
+  pinMode(EMERGENCY_STOP_PIN, INPUT);          // 緊急停止按鈕（根據硬體選擇 INPUT 或 INPUT_PULLUP）
+  // 如果按鈕按下時讀到 LOW，請改為：pinMode(EMERGENCY_STOP_PIN, INPUT_PULLUP);
   pinMode(PWM_CONTROL_PIN, OUTPUT);
   pinMode(RGB_RED_PIN, OUTPUT);
   pinMode(RGB_GREEN_PIN, OUTPUT);
@@ -452,9 +446,11 @@ void setup() {
   analogWrite(PWM_CONTROL_PIN, 0);
   setRGBColor(RGB_OFF);
   
+  // 初始化模組
   IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
   attachInterrupt(digitalPinToInterrupt(HALL_SPEED_PIN), speedInterrupt, FALLING);
   
+  // OLED 初始化（關鍵修正）
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println(F("OLED Fail"));
     setRGBColor(RGB_RED);
@@ -462,22 +458,31 @@ void setup() {
     while (1);
   }
   
+  // INA226 初始化
   ina226.init();
   Serial.println(F("INA226 OK"));
   
+  // MPU6050 初始化
   setupMPU();
   calibrateIMU();
   
+  // 啟動動畫
   Serial.println(F("Testing RGB..."));
+  // RGB 測試序列（確認接線正確）
   setRGBColor(RGB_RED);
+  Serial.println(F("RED"));
   delay(500);
   setRGBColor(RGB_GREEN);
+  Serial.println(F("GREEN"));
   delay(500);
   setRGBColor(RGB_BLUE);
+  Serial.println(F("BLUE"));
   delay(500);
   setRGBColor(RGB_YELLOW);
+  Serial.println(F("YELLOW"));
   delay(500);
   setRGBColor(RGB_PURPLE);
+  Serial.println(F("PURPLE"));
   delay(500);
   setRGBColor(RGB_OFF);
   
@@ -485,14 +490,11 @@ void setup() {
   soundStartup();
   
   Serial.println(F("=== READY ==="));
-  Serial.println(F("Speed threshold: 10 km/h"));
-  Serial.println(F("Wheel UP when speed >= 10 km/h"));
-  Serial.println(F("Wheel DOWN when speed < 10 km/h"));
   setRGBColor(RGB_GREEN);
 }
 
 // ============================================================================
-// Loop - 核心邏輯（修正版）
+// Loop - 核心邏輯
 // ============================================================================
 void loop() {
   uint32_t currentMillis = millis();
@@ -505,32 +507,23 @@ void loop() {
   
   current_A = ina226.getCurrent_A();
   
+  // 過電流蜂鳴器
   if (current_A > BUZZER_CURRENT_THRESHOLD) {
     tone(BUZZER_PIN, 1000);
   } else {
     noTone(BUZZER_PIN);
   }
   
-  // 【修正】速度更新邏輯
+  // 速度更新
   if (newSpeedData) {
     currentSpeed = calculateSpeed();
     newSpeedData = false;
     lastSpeedUpdate = millis();
     
-    // 【除錯】輸出速度資訊
-    Serial.print(F("[SPEED] Pulse #"));
-    Serial.print(speedPulseCount);
-    Serial.print(F(" | Speed: "));
-    Serial.print(currentSpeed, 2);
-    Serial.print(F(" km/h | Interval: "));
-    Serial.print(timeBetweenTriggers / 1000.0, 2);
-    Serial.println(F(" ms"));
+    // 【移除速度鎖定機制】
+    // 速度達標不再鎖定，而是由自動模式動態控制
   }
-  
   if (millis() - lastSpeedUpdate > SPEED_TIMEOUT) {
-    if (currentSpeed != 0.0) {
-      Serial.println(F("[SPEED] Timeout - Speed = 0"));
-    }
     currentSpeed = 0.0;
   }
   
@@ -540,17 +533,18 @@ void loop() {
     IrReceiver.resume();
   }
   
-  // 霍爾停止檢測
+  // 霍爾停止檢測（雙端點版本）
   byte hallStopUp = digitalRead(HALL_STOP_UP_PIN);
   byte hallStopDown = digitalRead(HALL_STOP_DOWN_PIN);
   
+  // 檢測上升端點霍爾
   if (hallStopUp != lastHallStopUpState) {
     lastHallStopUpState = hallStopUp;
     
-    if (hallStopUp == LOW) {
+    if (hallStopUp == LOW) {  // 碰到上升端點磁鐵
       hallStopLocked = true;
       manualMode = false;
-      wheelDown = false;
+      wheelDown = false;  // 鎖定在 UP 位置
       ctrlSrc = 1;
       
       soundLock();
@@ -561,13 +555,14 @@ void loop() {
     }
   }
   
+  // 檢測下降端點霍爾
   if (hallStopDown != lastHallStopDownState) {
     lastHallStopDownState = hallStopDown;
     
-    if (hallStopDown == LOW) {
+    if (hallStopDown == LOW) {  // 碰到下降端點磁鐵
       hallStopLocked = true;
       manualMode = false;
-      wheelDown = true;
+      wheelDown = true;  // 鎖定在 DOWN 位置
       ctrlSrc = 1;
       
       soundLock();
@@ -581,13 +576,16 @@ void loop() {
   // ========================================================================
   // 【階段 2】PWM 週期控制
   // ========================================================================
+  // 【修正】HALTED/COOLING 狀態也要輸出 PWM（讓線性致動器推下去）
   if (relayCmd == HIGH) {
+    // 如果是緊急狀態（HALTED/COOLING），直接全速 PWM，不做週期
     if (currentSystemState == HALTED || currentSystemState == COOLING_DOWN) {
       int potValue = analogRead(SPEED_POT_PIN);
       int pwmSpeed = map(potValue, 0, 1023, 0, 255);
       analogWrite(PWM_CONTROL_PIN, pwmSpeed);
-      pwmState = true;
+      pwmState = true;  // 標記為 ON
     }
+    // 正常狀態且未被霍爾鎖定，才做週期控制
     else if (!hallStopLocked && currentSystemState == RUNNING) {
       uint16_t interval = pwmState ? PWM_ON_DURATION : PWM_OFF_DURATION;
       
@@ -608,21 +606,23 @@ void loop() {
       pwmState = false;
     }
   } else {
+    // 繼電器 OFF 時，PWM 也關閉
     analogWrite(PWM_CONTROL_PIN, 0);
     pwmState = false;
   }
   
   // ========================================================================
-  // 【階段 3】三層決策邏輯（修正優先權）
+  // 【階段 3】三層決策邏輯
   // ========================================================================
   
   relayCmd = LOW;
   bool allowLowerPriority = true;
   RGBColor targetRGB = RGB_GREEN;
   
-  // 🔴 第一層：安全層（最高優先）
+  // 🔴 第一層：安全層
   bool isOverloaded = (current_A > MAX_CURRENT_A);
-  bool emergencyButtonPressed = (digitalRead(EMERGENCY_STOP_PIN) == LOW);  // 【修正】按下時為 LOW
+  bool emergencyButtonPressed = (digitalRead(EMERGENCY_STOP_PIN) == HIGH);  // 如果按鈕邏輯相反，改為 == LOW
+  // 【修正】急停條件：過載 或 緊急按鈕
   bool haltConditionActive = isOverloaded || emergencyButtonPressed;
   
   switch (currentSystemState) {
@@ -630,8 +630,11 @@ void loop() {
       if (haltConditionActive) {
         currentSystemState = HALTED;
         haltTime = currentMillis;
+        
+        // 【新增】緊急停止音效
         soundEmergency();
-        Serial.println(F("HALTED - Emergency button or overload"));
+        
+        Serial.println(F("HALTED"));
       }
       break;
       
@@ -675,7 +678,7 @@ void loop() {
       soundEmergency();
       showWheelAnim = true;
       wheelAnimStartTime = millis();
-      Serial.println(F("EMERGENCY TILT!"));
+      Serial.println(F("EMERGENCY!"));
     }
     relayCmd = HIGH;
     wheelDown = true;
@@ -686,7 +689,7 @@ void loop() {
   } else if (emergencyStop && abs(compAngleX) < TILT_SAFE) {
     emergencyStop = false;
     manualMode = false;
-    Serial.println(F("Emergency tilt cleared"));
+    Serial.println(F("Emerg clear"));
   }
   
   // 🔵 第二層：傾斜警告
@@ -705,7 +708,7 @@ void loop() {
         showWheelAnim = true;
         wheelAnimStartTime = millis();
         safeStartTime = 0;
-        Serial.println(F("TILT WARNING"));
+        Serial.println(F("TILT WARN"));
       }
     } else {
       tiltStartTime = 0;
@@ -722,7 +725,7 @@ void loop() {
             showWheelAnim = true;
             wheelAnimStartTime = millis();
             soundUp();
-            Serial.println(F("Tilt OK - Auto UP"));
+            Serial.println(F("Tilt OK"));
             safeStartTime = 0;
           }
         } else {
@@ -739,22 +742,20 @@ void loop() {
     }
   }
   
-  // 🟢 第三層：操作層（霍爾鎖定 > 手動 > 自動速度控制）
+  // 🟢 第三層：操作層
   if (allowLowerPriority) {
-    // 1. 霍爾停止鎖定（最高優先）
+    // 霍爾停止鎖定（最高優先）
     if (hallStopLocked) {
       relayCmd = wheelDown ? HIGH : LOW;
       targetRGB = wheelDown ? RGB_YELLOW : RGB_GREEN;
     } 
-    // 2. 手動模式（IR 控制）
+    // 手動模式（IR 控制）
     else if (manualMode) {
       relayCmd = wheelDown ? HIGH : LOW;
       targetRGB = wheelDown ? RGB_YELLOW : RGB_GREEN;
     } 
-    // 3. 【核心修正】自動速度控制
+    // 自動模式（速度控制）- 移除速度鎖定
     else {
-      // 速度邏輯：速度 < 10 km/h → 輔助輪 DOWN（繼電器 ON）
-      //          速度 >= 10 km/h → 輔助輪 UP（繼電器 OFF）
       bool shouldWheelDown = (currentSpeed < SPEED_THRESHOLD);
       
       if (shouldWheelDown != wheelDown) {
@@ -767,9 +768,9 @@ void loop() {
         showWheelAnim = true;
         wheelAnimStartTime = millis();
         
-        Serial.print(F("AUTO SPEED: "));
+        Serial.print(F("AUTO: "));
         Serial.print(currentSpeed, 1);
-        Serial.print(F(" km/h -> Wheel "));
+        Serial.print(F("km/h -> "));
         Serial.println(wheelDown ? F("DOWN") : F("UP"));
       }
       
@@ -782,10 +783,11 @@ void loop() {
   // 【階段 4】最終輸出
   // ========================================================================
   
-  // 繼電器輸出（如果是低電平觸發，請改為 !relayCmd）
+  // 如果您的繼電器模組是「低電平觸發」，請將下一行改為：
+  // digitalWrite(RELAY_PIN, !relayCmd);  // 反轉邏輯
   digitalWrite(RELAY_PIN, relayCmd);
   
-  // RGB LED 輸出
+  // 【修正】RGB LED 輸出（確保正確設定）
   setRGBColor(targetRGB);
   
   // ========================================================================
@@ -797,8 +799,9 @@ void loop() {
     lastDisplayTime = millis();
   }
   
-  // 序列埠輸出（增強版除錯）
+  // 序列埠輸出（除錯版本）
   if (millis() - lastPrintTime > 500) {
+    // 狀態顯示
     Serial.print(F("State:"));
     switch (currentSystemState) {
       case RUNNING: Serial.print(F("RUN")); break;
@@ -806,36 +809,31 @@ void loop() {
       case COOLING_DOWN: Serial.print(F("COOL")); break;
     }
     
-    Serial.print(F(" | Speed:"));
+    Serial.print(F(" | S:"));
     Serial.print(currentSpeed, 1);
-    Serial.print(F("km/h Angle:"));
+    Serial.print(F(" A:"));
     Serial.print((int)compAngleX);
-    Serial.print(F("° Current:"));
+    Serial.print(F(" C:"));
     Serial.print(current_A, 2);
-    Serial.print(F("A"));
     
-    Serial.print(F(" | Relay:"));
-    Serial.print(relayCmd ? F("ON") : F("OFF"));
-    Serial.print(F(" Wheel:"));
-    Serial.print(wheelDown ? F("DOWN") : F("UP"));
+    Serial.print(F(" | R:"));
+    Serial.print(relayCmd);
+    Serial.print(F(" W:"));
+    Serial.print(wheelDown ? F("DN") : F("UP"));
     Serial.print(F(" PWM:"));
     Serial.print(pwmState ? F("ON") : F("OFF"));
     
     Serial.print(F(" | HallUp:"));
-    Serial.print(digitalRead(HALL_STOP_UP_PIN) == LOW ? F("TRIG") : F("---"));
+    Serial.print(digitalRead(HALL_STOP_UP_PIN));
     Serial.print(F(" HallDn:"));
-    Serial.print(digitalRead(HALL_STOP_DOWN_PIN) == LOW ? F("TRIG") : F("---"));
+    Serial.print(digitalRead(HALL_STOP_DOWN_PIN));
     Serial.print(F(" EmgBtn:"));
-    Serial.print(digitalRead(EMERGENCY_STOP_PIN) == LOW ? F("PRESS") : F("---"));
+    Serial.print(digitalRead(EMERGENCY_STOP_PIN));
     
     Serial.print(F(" | Lock:"));
     Serial.print(hallStopLocked ? F("Y") : F("N"));
-    Serial.print(F(" Manual:"));
-    Serial.print(manualMode ? F("Y") : F("N"));
     Serial.print(F(" Src:"));
-    Serial.print(ctrlSrc);
-    Serial.print(F(" Pulses:"));
-    Serial.println(speedPulseCount);
+    Serial.println(ctrlSrc);
     
     lastPrintTime = millis();
   }
