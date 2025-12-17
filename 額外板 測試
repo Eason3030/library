@@ -1,1 +1,476 @@
-1
+// ============================================================================
+// 自行車輔助輪智能控制系統 v4.1 MEGA PRO (修正版)
+// 修正：PWM週期、RGB位置、傾斜震盪、電流警告
+// ============================================================================
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <IRremote.h>
+#include <INA226_WE.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+const bool BUTTON_IS_NC_TYPE = false;
+const bool IGNORE_CURRENT_SENSOR = true;
+
+#define NOTE_C5  523
+#define NOTE_E5  659
+#define NOTE_G5  784
+#define NOTE_C6  1047
+#define NOTE_A5  880
+
+#define MPU_6050 0x68
+#define PWR_MGMT_1 0x6B
+#define ACCEL_XOUT_H 0x3B
+#define GYRO_XOUT_H  0x43
+
+const byte BUZZER_PIN = 8;
+const byte RELAY_PIN = 11;
+const byte IR_RECEIVE_PIN = 3;
+const byte HALL_STOP_UP_PIN = 4;
+const byte HALL_STOP_DOWN_PIN = 10;
+const byte HALL_SPEED_PIN = 2;
+const byte EMERGENCY_STOP_PIN = 12;
+const byte PWM_CONTROL_PIN = 9;
+const byte SPEED_POT_PIN = A0;
+const byte RGB_RED_PIN = 5;
+const byte RGB_GREEN_PIN = 7;
+const byte RGB_BLUE_PIN = 6;
+const bool RGB_COMMON_ANODE = false;
+
+const uint16_t DEBOUNCE_DELAY = 30; // ms
+uint32_t lastDebounceUp = 0;
+uint32_t lastDebounceDown = 0;
+
+enum RGBColor : byte { RGB_OFF, RGB_GREEN, RGB_YELLOW, RGB_BLUE, RGB_RED, RGB_PURPLE };
+enum SystemState : byte { RUNNING, COOLING_DOWN };
+
+INA226_WE ina226;
+const float MAX_CURRENT_A = 5.0;
+const float BUZZER_CURRENT_THRESHOLD = 1.5;
+float current_A = 0.0;
+
+const uint16_t PWM_ON_DURATION = 1800;
+const uint16_t PWM_OFF_DURATION = 1800;
+uint32_t pwmPreviousMillis = 0;
+bool pwmState = false;
+
+#define WHEEL_CIRCUMFERENCE 204.2
+const float SPEED_THRESHOLD = 10.0;
+const uint16_t SPEED_TIMEOUT = 2000;
+
+volatile uint32_t lastSpeedTrigger = 0;
+volatile uint32_t timeBetweenTriggers = 0;
+volatile bool newSpeedData = false;
+float currentSpeed = 0.0;
+uint32_t lastSpeedUpdate = 0;
+
+float compAngleX = 0.0f;
+float gyroBiasX = 0.0f;
+float accelBiasX = 0.0f;
+
+const float SAFE_ANGLE = 20.0f;
+const float TILT_SAFE = 12.0f;
+const float EMERGENCY_ANGLE = 35.0f;
+const uint16_t TILT_TRIGGER_TIME = 500;
+const uint16_t AUTO_UP_DELAY = 3000;
+const uint16_t RECOVER_PROTECTION = 5000; // 修正：新增
+
+uint32_t tiltStartTime = 0;
+bool tiltWarning = false;
+uint32_t safeStartTime = 0;
+uint32_t tiltRecoverTime = 0; // 修正：新增
+
+SystemState currentSystemState = RUNNING;
+uint32_t haltTime = 0;
+const uint16_t RESTART_DELAY_MS = 5000;
+
+bool hallStopLocked = false;
+byte lastHallStopUpState = HIGH;
+byte lastHallStopDownState = HIGH;
+
+bool wheelDown = false;
+bool relayCmd = LOW;
+byte ctrlSrc = 0;
+bool manualMode = false;
+
+uint32_t lastPrintTime = 0;
+uint32_t lastDisplayTime = 0;
+uint32_t lastIRCode = 0;
+const uint16_t IR_DELAY = 500;
+uint32_t lastBeepTime = 0; // 修正：新增
+
+#define HISTORY_SIZE 32
+float speedHistory[HISTORY_SIZE];
+float angleHistory[HISTORY_SIZE];
+int historyIndex = 0;
+uint32_t lastHistoryUpdate = 0;
+
+void setRGB(byte r, byte g, byte b) {
+  if (RGB_COMMON_ANODE) {
+    analogWrite(RGB_RED_PIN, 255-r); analogWrite(RGB_GREEN_PIN, 255-g); analogWrite(RGB_BLUE_PIN, 255-b);
+  } else {
+    analogWrite(RGB_RED_PIN, r); analogWrite(RGB_GREEN_PIN, g); analogWrite(RGB_BLUE_PIN, b);
+  }
+}
+
+void setRGBColor(RGBColor c) {
+  switch(c) {
+    case RGB_OFF: setRGB(0,0,0); break;
+    case RGB_GREEN: setRGB(0,255,0); break;
+    case RGB_YELLOW: setRGB(255,255,0); break;
+    case RGB_BLUE: setRGB(0,0,255); break;
+    case RGB_RED: setRGB(255,0,0); break;
+    case RGB_PURPLE: setRGB(128,0,255); break;
+  }
+}
+
+RGBColor decideRGB() {
+  if (currentSystemState == COOLING_DOWN) return RGB_RED;
+  if (tiltWarning) return RGB_BLUE;
+  if (hallStopLocked) return RGB_PURPLE;
+  if (wheelDown) return RGB_YELLOW;
+  return RGB_GREEN;
+}
+
+void beep(uint16_t freq, byte duration) {
+  tone(BUZZER_PIN, freq, duration); delay(duration); noTone(BUZZER_PIN);
+}
+
+void soundStartup() { beep(NOTE_C5,100); beep(NOTE_G5,150); beep(NOTE_C6,200); }
+void soundDown() { beep(NOTE_G5,60); beep(NOTE_C5,100); }
+void soundUp() { beep(NOTE_C5,60); beep(NOTE_G5,100); }
+void soundLock() { beep(NOTE_C6,80); beep(NOTE_E5,80); }
+void soundEmergency() {
+  for(byte i=0;i<3;i++) { beep(NOTE_C6,100); delay(50); beep(NOTE_A5,100); delay(50); }
+}
+
+void speedInterrupt() {
+  uint32_t t = micros();
+  if (t - lastSpeedTrigger > 50000) {
+    timeBetweenTriggers = t - lastSpeedTrigger;
+    lastSpeedTrigger = t;
+    newSpeedData = true;
+  }
+}
+
+float calculateSpeed() {
+  if (timeBetweenTriggers == 0) return 0.0;
+  float timeInSec = timeBetweenTriggers/1000000.0;
+  return (WHEEL_CIRCUMFERENCE/timeInSec)*0.036;
+}
+
+int16_t read16(byte reg) {
+  Wire.beginTransmission(MPU_6050); Wire.write(reg); Wire.endTransmission(false);
+  Wire.requestFrom((byte)MPU_6050,(byte)2);
+  return (Wire.read()<<8)|Wire.read();
+}
+
+void setupMPU() {
+  Wire.beginTransmission(MPU_6050); Wire.write(PWR_MGMT_1); Wire.write(0x00); Wire.endTransmission();
+  delay(50);
+}
+
+void calibrateIMU() {
+  float sumAx=0, sumGx=0;
+  for(byte i=0;i<50;i++) {
+    sumAx += read16(ACCEL_XOUT_H)/16384.0f;
+    sumGx += read16(GYRO_XOUT_H)/131.0f;
+    delay(5);
+  }
+  accelBiasX = sumAx/50; gyroBiasX = sumGx/50;
+}
+
+void readIMU(float &ax, float &gx) {
+  ax = read16(ACCEL_XOUT_H)/16384.0f;
+  float az = read16(ACCEL_XOUT_H+4)/16384.0f;
+  gx = read16(GYRO_XOUT_H)/131.0f;
+  gx -= gyroBiasX; ax -= accelBiasX;
+  float accelAngle = atan2(ax,az)*57.2958f;
+  compAngleX = 0.98*(compAngleX+gx*0.01)+0.02*accelAngle;
+}
+
+void showStartupPro() {
+  display.clearDisplay(); display.setTextSize(2); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(15,10); display.print(F("BIKE"));
+  display.setCursor(10,30); display.print(F("ASSIST"));
+  display.display(); delay(800);
+  
+  display.clearDisplay(); display.setTextSize(1);
+  display.setCursor(25,15); display.print(F("MEGA PRO v4.1"));
+  display.setCursor(25,30); display.print(F("FIXED Edition"));
+  for(int i=0;i<128;i+=4) { display.fillRect(0,50,i,6,SSD1306_WHITE); display.display(); delay(15); }
+  delay(500);
+}
+
+void drawDashboard() {
+  display.clearDisplay();
+  display.fillRect(0,0,128,10,SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK); display.setTextSize(1); display.setCursor(2,1);
+  if (currentSystemState==COOLING_DOWN) display.print(F("! LOCKED !"));
+  else if (tiltWarning) display.print(F("TILT WARN"));
+  else if (hallStopLocked) display.print(F("HALL LOCK"));
+  else display.print(F("RUNNING"));
+  display.setCursor(100,1); display.print(millis()/1000); display.print(F("s"));
+  
+  display.setTextColor(SSD1306_WHITE); display.setTextSize(3); display.setCursor(2,14);
+  int speedInt = (int)currentSpeed;
+  if(speedInt<10) display.print(F(" ")); display.print(speedInt);
+  display.setTextSize(1); display.setCursor(2,40); display.print(F("km/h"));
+  int speedBar = map(constrain(currentSpeed,0,40),0,40,0,50);
+  display.drawRect(2,50,52,12,SSD1306_WHITE); display.fillRect(3,51,speedBar,10,SSD1306_WHITE);
+  
+  display.drawFastVLine(64,10,54,SSD1306_WHITE);
+  
+  display.setTextSize(2); display.setCursor(70,14);
+  int angleInt = (int)abs(compAngleX);
+  if(angleInt<10) display.print(F(" ")); display.print(angleInt); display.print(F("'"));
+  display.setTextSize(1); display.setCursor(70,32);
+  if(compAngleX>5) display.print(F(">>> R"));
+  else if(compAngleX<-5) display.print(F("L <<<"));
+  else display.print(F("LEVEL"));
+  
+  int angleBar = map(constrain(abs(compAngleX),0,35),0,35,0,25);
+  display.drawRect(68,43,58,8,SSD1306_WHITE);
+  display.drawFastVLine(97,42,10,SSD1306_WHITE);
+  if(compAngleX>0) display.fillRect(98,44,angleBar,6,SSD1306_WHITE);
+  else display.fillRect(97-angleBar,44,angleBar,6,SSD1306_WHITE);
+  
+  display.drawRect(68,53,58,10,SSD1306_WHITE); display.setTextSize(1);
+  if(wheelDown) {
+    display.fillRect(69,54,56,8,SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK); display.setCursor(80,55); display.print(F("DOWN"));
+  } else {
+    display.setCursor(88,55); display.print(F("UP"));
+  }
+  display.display();
+}
+
+void drawDetailScreen() {
+  display.clearDisplay();
+  display.fillRect(0,0,128,10,SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK); display.setTextSize(1); display.setCursor(30,1);
+  display.print(F("DETAIL MODE"));
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(2,14); display.print(F("Speed: ")); display.print(currentSpeed,1); display.print(F(" km/h"));
+  display.setCursor(2,24); display.print(F("Angle: ")); display.print(compAngleX,1); display.print(F(" deg"));
+  display.setCursor(2,34); display.print(F("Current: ")); display.print(current_A,2); display.print(F(" A"));
+  display.setCursor(2,44); display.print(F("Wheel: ")); display.print(wheelDown?F("DOWN"):F("UP  "));
+  display.setCursor(2,54); display.print(F("Mode: "));
+  if(manualMode) display.print(F("MANUAL")); else display.print(F("AUTO  "));
+  display.display();
+}
+
+void drawChartScreen() {
+  display.clearDisplay();
+  display.fillRect(0,0,128,10,SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK); display.setTextSize(1); display.setCursor(35,1);
+  display.print(F("HISTORY"));
+  display.setTextColor(SSD1306_WHITE); display.setCursor(2,12); display.print(F("SPD"));
+  for(int i=1;i<HISTORY_SIZE;i++) {
+    int x1=i*3, y1=30-(int)(speedHistory[i-1]/2), x2=(i+1)*3, y2=30-(int)(speedHistory[i]/2);
+    y1=constrain(y1,12,30); y2=constrain(y2,12,30);
+    display.drawLine(x1,y1,x2,y2,SSD1306_WHITE);
+  }
+  display.setCursor(2,36); display.print(F("ANG"));
+  for(int i=1;i<HISTORY_SIZE;i++) {
+    int x1=i*3, y1=52-(int)(angleHistory[i-1]), x2=(i+1)*3, y2=52-(int)(angleHistory[i]);
+    y1=constrain(y1,36,62); y2=constrain(y2,36,62);
+    display.drawLine(x1,y1,x2,y2,SSD1306_WHITE);
+  }
+  display.display();
+}
+
+void handleIRCommand(uint32_t code) {
+  if(millis()-lastIRCode>IR_DELAY) {
+    lastIRCode=millis();
+    if(hallStopLocked) hallStopLocked=false;
+    wheelDown=!wheelDown; manualMode=true; ctrlSrc=2;
+    beep(NOTE_A5,40);
+  }
+}
+
+void setup() {
+  Serial.begin(115200); delay(100); Wire.begin();
+  pinMode(BUZZER_PIN,OUTPUT); pinMode(RELAY_PIN,OUTPUT);
+  pinMode(HALL_STOP_UP_PIN,INPUT_PULLUP); pinMode(HALL_STOP_DOWN_PIN,INPUT_PULLUP);
+  pinMode(HALL_SPEED_PIN,INPUT_PULLUP); pinMode(EMERGENCY_STOP_PIN,INPUT_PULLUP);
+  pinMode(PWM_CONTROL_PIN,OUTPUT);
+  pinMode(RGB_RED_PIN,OUTPUT); pinMode(RGB_GREEN_PIN,OUTPUT); pinMode(RGB_BLUE_PIN,OUTPUT);
+  digitalWrite(RELAY_PIN,LOW); analogWrite(PWM_CONTROL_PIN,0); setRGBColor(RGB_OFF);
+  IrReceiver.begin(IR_RECEIVE_PIN,ENABLE_LED_FEEDBACK);
+  attachInterrupt(digitalPinToInterrupt(HALL_SPEED_PIN),speedInterrupt,FALLING);
+  if(!display.begin(SSD1306_SWITCHCAPVCC,0x3C)) { Serial.println(F("OLED Fail")); while(1); }
+  ina226.init(); setupMPU(); calibrateIMU();
+  for(int i=0;i<HISTORY_SIZE;i++) { speedHistory[i]=0; angleHistory[i]=0; }
+  showStartupPro(); soundStartup();
+  Serial.println(F("=== v4.1 READY ==="));
+}
+
+void loop() {
+  uint32_t currentMillis = millis();
+  float ax, gx; readIMU(ax,gx); current_A = ina226.getCurrent_A();
+  
+  if(newSpeedData) { currentSpeed=calculateSpeed(); newSpeedData=false; lastSpeedUpdate=millis(); }
+  if(millis()-lastSpeedUpdate>SPEED_TIMEOUT) currentSpeed=0.0;
+  
+  if(millis()-lastHistoryUpdate>200) {
+    lastHistoryUpdate=millis();
+    speedHistory[historyIndex]=currentSpeed;
+    angleHistory[historyIndex]=abs(compAngleX);
+    historyIndex=(historyIndex+1)%HISTORY_SIZE;
+  }
+  
+  if(IrReceiver.decode()) { handleIRCommand(IrReceiver.decodedIRData.decodedRawData); IrReceiver.resume(); }
+  
+  byte hallStopUp = digitalRead(HALL_STOP_UP_PIN);
+if (hallStopUp != lastHallStopUpState) {
+  if (millis() - lastDebounceUp > DEBOUNCE_DELAY) {
+    lastDebounceUp = millis();
+    lastHallStopUpState = hallStopUp;
+    if (hallStopUp == LOW) { // 按下觸發
+      hallStopLocked = true;
+      manualMode = false;
+      wheelDown = false;
+      ctrlSrc = 1;
+      soundLock();
+      Serial.println(F("MICRO SWITCH UP PRESS"));
+    }
+  }
+}
+
+byte hallStopDown = digitalRead(HALL_STOP_DOWN_PIN);
+if (hallStopDown != lastHallStopDownState) {
+  if (millis() - lastDebounceDown > DEBOUNCE_DELAY) {
+    lastDebounceDown = millis();
+    lastHallStopDownState = hallStopDown;
+    if (hallStopDown == LOW) { // 按下觸發
+      hallStopLocked = true;
+      manualMode = false;
+      wheelDown = true;
+      ctrlSrc = 1;
+      soundLock();
+      Serial.println(F("MICRO SWITCH DOWN PRESS"));
+    }
+  }
+}
+
+  int btnReading = digitalRead(EMERGENCY_STOP_PIN);
+  bool isButtonPressed = BUTTON_IS_NC_TYPE?(btnReading==HIGH):(btnReading==LOW);
+  bool isOverloaded = !IGNORE_CURRENT_SENSOR&&(current_A>MAX_CURRENT_A);
+  bool haltTrigger = (isOverloaded||isButtonPressed)&&(millis()>3000);
+  
+  bool allowRun=true; RGBColor targetRGB=RGB_GREEN; relayCmd=LOW;
+  
+  switch(currentSystemState) {
+    case RUNNING:
+      if(haltTrigger) {
+        currentSystemState=COOLING_DOWN; haltTime=currentMillis; soundEmergency();
+        analogWrite(PWM_CONTROL_PIN,0); digitalWrite(RELAY_PIN,LOW); pwmState=false;
+        Serial.print(F("STOP: ")); 
+        if(isButtonPressed) Serial.print(F("BTN ")); 
+        if(isOverloaded) Serial.print(F("CUR ")); 
+        Serial.println();
+      }
+      break;
+    case COOLING_DOWN:
+      allowRun=false; relayCmd=LOW; analogWrite(PWM_CONTROL_PIN,0); targetRGB=RGB_RED;
+      if(currentMillis-haltTime>=RESTART_DELAY_MS) {
+        currentSystemState=RUNNING; manualMode=false; hallStopLocked=false;
+        Serial.println(F("RECOVERED")); soundUp();
+      }
+      break;
+  }
+  
+  if(allowRun) {
+    if(abs(compAngleX)>EMERGENCY_ANGLE) {
+      currentSystemState=COOLING_DOWN; haltTime=currentMillis; soundEmergency(); allowRun=false;
+      Serial.println(F("EMERG TILT!"));
+    }
+    else if(abs(compAngleX)>SAFE_ANGLE) {
+      if(tiltStartTime==0) tiltStartTime=millis();
+      if(!tiltWarning&&(millis()-tiltStartTime>=TILT_TRIGGER_TIME)) {
+        tiltWarning=true; wheelDown=true; manualMode=false;
+        beep(NOTE_G5,150); soundDown(); safeStartTime=0;
+        Serial.println(F("TILT WARN"));
+      }
+    } else {
+      tiltStartTime=0;
+      if(tiltWarning) {
+        if(abs(compAngleX)<TILT_SAFE) {
+          if(safeStartTime==0) safeStartTime=millis();
+          if(millis()-safeStartTime>=AUTO_UP_DELAY) {
+            tiltWarning=false;
+            // 修正：避免與手動模式衝突
+            if(!manualMode&&!hallStopLocked) wheelDown=false;
+            soundUp(); tiltRecoverTime=millis();
+            Serial.println(F("TILT OK"));
+          }
+        } else { safeStartTime=0; }
+      }
+    }
+  }
+  
+  // 修正：增加恢復保護時間
+  if(allowRun&&!manualMode&&!hallStopLocked&&!tiltWarning&&(millis()-tiltRecoverTime>RECOVER_PROTECTION)) {
+    if(currentSpeed<SPEED_THRESHOLD&&!wheelDown) { wheelDown=true; ctrlSrc=3; soundDown(); }
+    else if(currentSpeed>=SPEED_THRESHOLD&&wheelDown) { wheelDown=false; ctrlSrc=3; soundUp(); }
+  }
+  
+  if(allowRun) {
+    relayCmd = wheelDown?HIGH:LOW;
+    
+    // 修正：真正的PWM週期控制
+    if(currentMillis-pwmPreviousMillis>=(pwmState?PWM_ON_DURATION:PWM_OFF_DURATION)) {
+      pwmPreviousMillis=currentMillis;
+      pwmState=!pwmState; // 切換開關
+    }
+    
+    if(wheelDown&&pwmState) {
+      int potValue=analogRead(SPEED_POT_PIN);
+      int pwmValue=map(potValue,0,1023,50,255);
+      analogWrite(PWM_CONTROL_PIN,pwmValue);
+    } else {
+      analogWrite(PWM_CONTROL_PIN,0);
+    }
+    digitalWrite(RELAY_PIN,relayCmd);
+  }
+  
+  // 修正：RGB控制位置正確
+  setRGBColor(decideRGB());
+  
+  // 修正：電流警告音效（非阻塞）
+  if(!IGNORE_CURRENT_SENSOR&&current_A>BUZZER_CURRENT_THRESHOLD) {
+    if(millis()-lastBeepTime>500) {
+      tone(BUZZER_PIN,1000,100);
+      lastBeepTime=millis();
+    }
+  }
+  
+  if(millis()-lastDisplayTime>100) {
+    lastDisplayTime=millis();
+    int displayMode=(millis()/5000)%3;
+    switch(displayMode) {
+      case 0: drawDashboard(); break;
+      case 1: drawDetailScreen(); break;
+      case 2: drawChartScreen(); break;
+    }
+  }
+  
+  if(millis()-lastPrintTime>1000) {
+    lastPrintTime=millis();
+    Serial.print(F("State:")); Serial.print(currentSystemState==RUNNING?F("RUN"):F("COOL"));
+    Serial.print(F("|Whl:")); Serial.print(wheelDown?F("DN"):F("UP"));
+    Serial.print(F("|Spd:")); Serial.print(currentSpeed,1);
+    Serial.print(F("|Ang:")); Serial.print(compAngleX,1);
+    Serial.print(F("|A:")); Serial.print(current_A,2);
+    if(tiltWarning) Serial.print(F("[TILT]"));
+    if(hallStopLocked) Serial.print(F("[LOCK]"));
+    if(manualMode) Serial.print(F("[MAN]"));
+    Serial.println();
+  }
+}
