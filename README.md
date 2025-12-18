@@ -117,128 +117,81 @@
 
 ```mermaid
 graph TD
-    Start([系統啟動]) --> Init[初始化設定]
-    Init --> InitHW[硬體初始化<br/>- I2C, GPIO, 中斷<br/>- OLED 128x64<br/>- MPU6050, INA226]
-    InitHW --> Calib[IMU 校正<br/>陀螺儀零點偏移]
-    Calib --> StartAnim[開機動畫<br/>MEGA PRO v4.0]
+    Start([系統啟動]) --> Init[初始化設定<br/>- I2C, GPIO, 中斷<br/>- OLED 128x64<br/>- MPU6050, INA226]
+    Init --> Calib[IMU 校正<br/>陀螺儀零點偏移]
+    Calib --> StartAnim[開機動畫]
     StartAnim --> StartSound[啟動音效]
-    StartSound --> MainLoop{主迴圈}
+    StartSound --> InitWheel[輔助輪預設下降<br/>wheelDown = true, PWM 輸出]
+    InitWheel --> MainLoop{主迴圈}
     
     MainLoop --> ReadSensors[讀取感測器]
     ReadSensors --> ReadIMU[讀取 MPU6050<br/>計算傾斜角度]
-    ReadIMU --> ReadCurrent[讀取電流感測器<br/>INA226]
-    ReadCurrent --> ReadSpeed[計算速度<br/>霍爾中斷數據]
+    ReadSensors --> ReadCurrent[讀取 INA226 電流]
+    ReadSensors --> ReadSpeed[計算速度<br/>霍爾中斷]
     
-    ReadSpeed --> UpdateHistory[更新歷史數據<br/>速度/角度記錄]
-    UpdateHistory --> CheckIR{紅外線<br/>接收?}
+    ReadIMU --> TiltCheck
+    ReadCurrent --> EmergencyCheck
+    ReadSpeed --> SpeedCheck
+
+    TiltCheck{傾斜保護}
+    TiltCheck -->|> EMERGENCY_ANGLE| EmergencyTilt[緊急傾斜!<br/>停止 PWM, wheelDown 強制下降]
+    TiltCheck -->|> SAFE_ANGLE| TiltWarn{持續>0.5秒?}
+    TiltCheck -->|正常| Continue
     
-    CheckIR -->|Yes| HandleIR[處理紅外線指令<br/>切換輔助輪狀態<br/>進入手動模式]
-    CheckIR -->|No| CheckHall
-    HandleIR --> CheckHall
-    
-    CheckHall{霍爾限位<br/>觸發?}
-    CheckHall -->|上限位| HallUp[鎖定輔助輪上升<br/>取消手動模式<br/>播放鎖定音效]
-    CheckHall -->|下限位| HallDown[鎖定輔助輪下降<br/>取消手動模式<br/>播放鎖定音效]
-    CheckHall -->|No| CheckEmergency
-    HallUp --> CheckEmergency
-    HallDown --> CheckEmergency
-    
-    CheckEmergency{緊急停止?}
-    CheckEmergency -->|按鈕按下<br/>或電流過載| EmergencyStop[進入冷卻模式<br/>停止馬達/繼電器<br/>播放緊急警報]
-    CheckEmergency -->|正常| CheckState
-    EmergencyStop --> StateCheck
-    
-    CheckState{當前<br/>系統狀態?}
-    
-    StateCheck{系統狀態機}
-    StateCheck -->|RUNNING| RunningState[運行模式]
-    StateCheck -->|COOLING_DOWN| CoolingState[冷卻模式<br/>禁止所有動作<br/>RGB 紅燈]
-    
-    CoolingState --> CoolTimer{冷卻時間<br/>≥5秒?}
-    CoolTimer -->|Yes| Recover[恢復運行<br/>重置手動/鎖定<br/>播放恢復音效]
+    TiltWarn -->|Yes| ActivateWarn[啟動傾斜警告<br/>輔助輪下降, RGB 藍燈]
+    TiltWarn -->|No| Continue
+    ActivateWarn --> TiltRecoverCheck{角度<12°持續>3秒?}
+    TiltRecoverCheck -->|Yes| TiltRecover[解除警告, wheelDown 可上升]
+    TiltRecoverCheck -->|No| Continue
+    TiltRecover --> Continue
+    Continue --> ExecuteControl
+
+    EmergencyCheck{緊急停止?}
+    EmergencyCheck -->|按鈕或電流過載| EmergencyStop[停止 PWM, COOLING_DOWN, RGB 紅燈, 警報音]
+    EmergencyCheck -->|正常| ExecuteControl
+    EmergencyStop --> CoolTimer{冷卻時間≥5秒?}
+    CoolTimer -->|Yes| Recover[恢復運行, 重置手動/鎖定, 播放音效]
     CoolTimer -->|No| KeepCool[保持冷卻]
-    Recover --> TiltProtect
-    KeepCool --> UpdateDisplay
-    
-    RunningState --> TiltProtect{傾斜保護檢查}
-    
-    TiltProtect -->|角度>35°| EmergencyTilt[緊急傾斜!<br/>進入冷卻模式<br/>緊急警報]
-    TiltProtect -->|角度>20°| TiltWarn{持續>0.5秒?}
-    TiltProtect -->|角度正常| TiltNormal
-    
-    EmergencyTilt --> UpdateDisplay
-    
-    TiltWarn -->|Yes| ActivateWarn[啟動傾斜警告<br/>強制輔助輪下降<br/>取消手動模式<br/>RGB 藍燈]
-    TiltWarn -->|No| CheckSpeed
-    
-    ActivateWarn --> TiltRecoverCheck{角度<12°<br/>持續>3秒?}
-    TiltRecoverCheck -->|Yes| TiltRecover[解除傾斜警告<br/>輔助輪上升<br/>播放恢復音效]
-    TiltRecoverCheck -->|No| MaintainWarn[保持警告狀態]
-    TiltRecover --> CheckSpeed
-    MaintainWarn --> CheckSpeed
-    
-    TiltNormal --> CheckSpeed
-    
-    CheckSpeed{速度自動控制<br/>非手動/鎖定/警告}
-    CheckSpeed -->|速度<10 km/h<br/>且輪子上升| AutoDown[自動下降輔助輪<br/>播放下降音效]
-    CheckSpeed -->|速度≥10 km/h<br/>且輪子下降| AutoUp[自動上升輔助輪<br/>播放上升音效]
-    CheckSpeed -->|維持現狀| KeepStatus[保持當前狀態]
-    
+    Recover --> ExecuteControl
+    KeepCool --> ExecuteControl
+
+    SpeedCheck{自動速度控制<br/>非手動/非傾斜警告}
+    SpeedCheck -->|速度<10 km/h 且輪子上升| AutoDown[自動下降輔助輪]
+    SpeedCheck -->|速度≥10 km/h 且輪子下降| AutoUp[自動上升輔助輪]
+    SpeedCheck -->|維持現狀| KeepStatus
     AutoDown --> ExecuteControl
     AutoUp --> ExecuteControl
     KeepStatus --> ExecuteControl
-    
-    ExecuteControl[執行控制邏輯]
-    ExecuteControl --> PWMControl{PWM 週期控制}
-    PWMControl -->|輔助輪下降| PWMOn[ON週期 1.8秒<br/>PWM 輸出<br/>根據電位器調速]
-    PWMControl -->|輔助輪上升| PWMOff[OFF週期 1.8秒<br/>PWM 關閉]
-    
-    PWMOn --> RelayControl
-    PWMOff --> RelayControl
-    
-    RelayControl[繼電器控制<br/>下降=ON / 上升=OFF]
-    RelayControl --> RGBControl
-    
-    RGBControl{RGB 狀態燈}
-    RGBControl -->|冷卻中| RGB_Red[紅燈]
-    RGBControl -->|傾斜警告| RGB_Blue[藍燈]
-    RGBControl -->|霍爾鎖定| RGB_Purple[紫燈]
-    RGBControl -->|輔助輪下降| RGB_Yellow[黃燈]
-    RGBControl -->|正常運行| RGB_Green[綠燈]
-    
-    RGB_Red --> CurrentAlarm
-    RGB_Blue --> CurrentAlarm
-    RGB_Purple --> CurrentAlarm
-    RGB_Yellow --> CurrentAlarm
-    RGB_Green --> CurrentAlarm
-    
-    CurrentAlarm{電流>1.5A?}
-    CurrentAlarm -->|Yes| BuzzerAlarm[蜂鳴器警報<br/>1kHz 脈衝]
-    CurrentAlarm -->|No| UpdateDisplay
-    BuzzerAlarm --> UpdateDisplay
-    
-    UpdateDisplay[更新 OLED 顯示<br/>每100ms刷新]
-    UpdateDisplay --> DisplayMode{顯示模式<br/>每5秒切換}
-    
-    DisplayMode -->|模式0| Dashboard[儀表板模式<br/>速度/角度大數字<br/>狀態條圖]
-    DisplayMode -->|模式1| Detail[詳細數據模式<br/>所有參數列表]
-    DisplayMode -->|模式2| Chart[歷史圖表模式<br/>速度/角度曲線]
-    
-    Dashboard --> SerialOutput
-    Detail --> SerialOutput
-    Chart --> SerialOutput
-    
-    SerialOutput[序列埠輸出<br/>每1秒除錯資訊]
+
+    ExecuteControl[執行控制邏輯<br/>PWM 控制線性致動器<br/>motionState MOVING_UP/MOVING_DOWN]
+    ExecuteControl --> HallLimitCheck{磁簧行程保護}
+    HallLimitCheck -->|上限| StopUp[停止 PWM, motionState=IDLE]
+    HallLimitCheck -->|下限| StopDown[停止 PWM, motionState=IDLE]
+    HallLimitCheck -->|未觸發| ContinueControl[持續 PWM 輸出]
+    StopUp --> UpdateRGB
+    StopDown --> UpdateRGB
+    ContinueControl --> UpdateRGB
+
+    UpdateRGB{RGB LED 狀態燈}
+    UpdateRGB -->|冷卻中| RGB_Red[紅燈]
+    UpdateRGB -->|傾斜警告| RGB_Blue[藍燈]
+    UpdateRGB -->|下降中| RGB_Yellow[黃燈]
+    UpdateRGB -->|正常| RGB_Green[綠燈]
+    RGB_Red --> UpdateDisplay
+    RGB_Blue --> UpdateDisplay
+    RGB_Yellow --> UpdateDisplay
+    RGB_Green --> UpdateDisplay
+
+    UpdateDisplay[更新 OLED 顯示<br/>儀表板/詳細數據模式切換]
+    UpdateDisplay --> SerialOutput[序列埠除錯輸出]
     SerialOutput --> MainLoop
-    
+
     style Start fill:#90EE90
     style EmergencyStop fill:#FF6B6B
     style EmergencyTilt fill:#FF6B6B
     style TiltWarn fill:#FFD93D
-    style CoolingState fill:#FF6B6B
     style RGB_Red fill:#FF6B6B
     style RGB_Blue fill:#6BCF7F
     style RGB_Green fill:#90EE90
     style RGB_Yellow fill:#FFD93D
-    style RGB_Purple fill:#C77DFF
     style MainLoop fill:#87CEEB
