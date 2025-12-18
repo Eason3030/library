@@ -1,0 +1,737 @@
+// ============================================================================
+// 自行車輔助輪智能控制系統 v4.3 - 防當機版
+//
+// 【核心設計原則】
+// 1. PWM = 唯一啟停手段（不控制方向）
+// 2. 繼電器 = 方向切換（HIGH=上升, LOW=下降）
+// 3. 磁簧開關 = 行程限位保護
+// 4. 霍爾感測器 = 僅測速
+// 5. 非阻塞設計 = 防止當機
+//
+// 【狀態機邏輯】
+// IDLE → 接收指令 → 設定方向 → MOVING_UP/DOWN → 觸發磁簧 → IDLE
+// ============================================================================
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <IRremote.h>
+#include <INA226_WE.h>
+
+// ============================================================================
+// OLED 設定
+// ============================================================================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ============================================================================
+// 系統設定
+// ============================================================================
+const bool BUTTON_IS_NC_TYPE = true;
+const bool IGNORE_CURRENT_SENSOR = true;
+
+// ============================================================================
+// 音符定義
+// ============================================================================
+#define NOTE_C5  523
+#define NOTE_E5  659
+#define NOTE_G5  784
+#define NOTE_C6  1047
+#define NOTE_A5  880
+
+// ============================================================================
+// MPU6050 設定
+// ============================================================================
+#define MPU_6050 0x68
+#define PWR_MGMT_1 0x6B
+#define ACCEL_XOUT_H 0x3B
+#define GYRO_XOUT_H  0x43
+
+// ============================================================================
+// 腳位定義
+// ============================================================================
+const byte BUZZER_PIN = 8;
+const byte RELAY_PIN = 11;              // 方向切換（HIGH=上升, LOW=下降）
+const byte IR_RECEIVE_PIN = 3;
+const byte LIMIT_UP_PIN = 4;            // 上限磁簧開關
+const byte LIMIT_DOWN_PIN = 10;         // 下限磁簧開關
+const byte HALL_SPEED_PIN = 2;          // 測速用霍爾
+const byte EMERGENCY_STOP_PIN = 12;
+const byte PWM_CONTROL_PIN = 9;         // PWM 控制（唯一啟停手段）
+const byte SPEED_POT_PIN = A0;
+
+const byte RGB_RED_PIN = 5;
+const byte RGB_GREEN_PIN = 7;
+const byte RGB_BLUE_PIN = 6;
+const bool RGB_COMMON_ANODE = false;
+
+// ============================================================================
+// 系統狀態定義
+// ============================================================================
+enum MotionState : byte {
+IDLE,           // 停止
+MOVING_UP,      // 上升中
+MOVING_DOWN     // 下降中
+};
+
+enum SystemState : byte {
+RUNNING,        // 正常運作
+COOLING_DOWN,   // 緊急停止冷卻
+EMERGENCY       // 緊急狀態
+};
+
+enum RGBColor : byte {
+RGB_OFF, RGB_GREEN, RGB_YELLOW, RGB_BLUE, RGB_RED, RGB_PURPLE
+};
+
+// ============================================================================
+// 全域變數
+// ============================================================================
+INA226_WE ina226;
+const float MAX_CURRENT_A = 5.0;
+float current_A = 0.0;
+
+MotionState motionState = IDLE;
+SystemState currentSystemState = RUNNING;
+
+// 速度測量
+#define WHEEL_CIRCUMFERENCE 204.2
+const float SPEED_THRESHOLD = 10.0;
+const uint16_t SPEED_TIMEOUT = 2000;
+volatile uint32_t lastSpeedTrigger = 0;
+volatile uint32_t timeBetweenTriggers = 0;
+volatile bool newSpeedData = false;
+float currentSpeed = 0.0;
+uint32_t lastSpeedUpdate = 0;
+
+// IMU 資料
+float compAngleX = 0.0f;
+float gyroBiasX = 0.0f;
+float accelBiasX = 0.0f;
+
+// 傾斜保護
+const float SAFE_ANGLE = 20.0f;
+const float TILT_SAFE = 12.0f;
+const float EMERGENCY_ANGLE = 35.0f;
+const uint16_t TILT_TRIGGER_TIME = 500;
+const uint16_t AUTO_UP_DELAY = 3000;
+uint32_t tiltStartTime = 0;
+bool tiltWarning = false;
+uint32_t safeStartTime = 0;
+
+// 控制變數
+bool wheelDown = false;         // 目標狀態
+bool manualMode = false;
+byte ctrlSrc = 0;               // 0=無, 1=磁簧, 2=IR, 3=自動, 4=傾斜
+
+// 時間控制
+uint32_t haltTime = 0;
+const uint16_t RESTART_DELAY_MS = 5000;
+uint32_t lastPrintTime = 0;
+uint32_t lastDisplayTime = 0;
+uint32_t lastIRCode = 0;
+const uint16_t IR_DELAY = 500;
+
+// 非阻塞音效
+uint32_t beepEndTime = 0;
+bool isBeeping = false;
+
+// 看門狗
+uint32_t lastLoopTime = 0;
+const uint32_t WATCHDOG_TIMEOUT = 2000;
+
+// PWM 目標值
+int targetPWM = 0;
+
+// ============================================================================
+// RGB LED 控制
+// ============================================================================
+void setRGB(byte r, byte g, byte b) {
+if (RGB_COMMON_ANODE) {
+analogWrite(RGB_RED_PIN, 255-r);
+analogWrite(RGB_GREEN_PIN, 255-g);
+analogWrite(RGB_BLUE_PIN, 255-b);
+} else {
+analogWrite(RGB_RED_PIN, r);
+analogWrite(RGB_GREEN_PIN, g);
+analogWrite(RGB_BLUE_PIN, b);
+}
+}
+
+void setRGBColor(RGBColor c) {
+switch(c) {
+case RGB_OFF: setRGB(0,0,0); break;
+case RGB_GREEN: setRGB(0,255,0); break;
+case RGB_YELLOW: setRGB(255,255,0); break;
+case RGB_BLUE: setRGB(0,0,255); break;
+case RGB_RED: setRGB(255,0,0); break;
+case RGB_PURPLE: setRGB(128,0,255); break;
+}
+}
+
+RGBColor decideRGB() {
+if (currentSystemState == COOLING_DOWN || currentSystemState == EMERGENCY) return RGB_RED;
+if (tiltWarning) return RGB_BLUE;
+if (motionState == MOVING_DOWN) return RGB_YELLOW;
+if (motionState == MOVING_UP) return RGB_GREEN;
+if (wheelDown) return RGB_YELLOW;
+return RGB_GREEN;
+}
+
+// ============================================================================
+// 非阻塞音效（不使用 delay）
+// ============================================================================
+void beepStart(uint16_t freq, uint16_t duration) {
+tone(BUZZER_PIN, freq);
+beepEndTime = millis() + duration;
+isBeeping = true;
+}
+
+void beepUpdate() {
+if (isBeeping && millis() >= beepEndTime) {
+noTone(BUZZER_PIN);
+isBeeping = false;
+}
+}
+
+// ============================================================================
+// 速度計算
+// ============================================================================
+void speedInterrupt() {
+uint32_t t = micros();
+if (t - lastSpeedTrigger > 50000) {
+timeBetweenTriggers = t - lastSpeedTrigger;
+lastSpeedTrigger = t;
+newSpeedData = true;
+}
+}
+
+float calculateSpeed() {
+if (timeBetweenTriggers == 0) return 0.0;
+float timeInSec = timeBetweenTriggers/1000000.0;
+return (WHEEL_CIRCUMFERENCE/timeInSec)*0.036;
+}
+
+// ============================================================================
+// MPU6050 函式
+// ============================================================================
+int16_t read16(byte reg) {
+Wire.beginTransmission(MPU_6050);
+Wire.write(reg);
+Wire.endTransmission(false);
+Wire.requestFrom((byte)MPU_6050,(byte)2);
+return (Wire.read()<<8)|Wire.read();
+}
+
+void setupMPU() {
+Wire.beginTransmission(MPU_6050);
+Wire.write(PWR_MGMT_1);
+Wire.write(0x00);
+Wire.endTransmission();
+delay(50);
+}
+
+void calibrateIMU() {
+float sumAx=0, sumGx=0;
+for(byte i=0; i<50; i++) {
+sumAx += read16(ACCEL_XOUT_H)/16384.0f;
+sumGx += read16(GYRO_XOUT_H)/131.0f;
+delay(5);
+}
+accelBiasX = sumAx/50;
+gyroBiasX = sumGx/50;
+}
+
+void readIMU(float &ax, float &gx) {
+ax = read16(ACCEL_XOUT_H)/16384.0f;
+float az = read16(ACCEL_XOUT_H+4)/16384.0f;
+gx = read16(GYRO_XOUT_H)/131.0f;
+gx -= gyroBiasX;
+ax -= accelBiasX;
+float accelAngle = atan2(ax,az)*57.2958f;
+compAngleX = 0.98*(compAngleX+gx*0.01)+0.02*accelAngle;
+}
+
+// ============================================================================
+// OLED 顯示
+// ============================================================================
+void showStartupPro() {
+display.clearDisplay();
+display.setTextSize(3);
+display.setTextColor(SSD1306_WHITE);
+display.setCursor(15,10);
+display.print(F(“BIKE”));
+display.setCursor(10,40);
+display.setTextSize(2);
+display.print(F(“v4.3”));
+display.display();
+delay(1000);
+}
+
+void drawDashboard() {
+display.clearDisplay();
+
+// 超大速度顯示
+display.setTextColor(SSD1306_WHITE);
+display.setTextSize(4);
+
+int speedInt = (int)currentSpeed;
+int xPos = (speedInt < 10) ? 40 : 10;
+
+display.setCursor(xPos, 5);
+display.print(speedInt);
+
+// 單位
+display.setTextSize(2);
+display.setCursor(85, 15);
+display.print(F(“km”));
+display.setCursor(85, 30);
+display.print(F(”/h”));
+
+// 底部資訊
+display.setTextSize(1);
+display.setCursor(2, 54);
+
+// 角度
+display.print(F(“A:”));
+int angleInt = (int)abs(compAngleX);
+if(angleInt < 10) display.print(F(” “));
+display.print(angleInt);
+display.print(F(”’”));
+
+// 方向
+if(compAngleX > 5) display.print(F(“R”));
+else if(compAngleX < -5) display.print(F(“L”));
+else display.print(F(”-”));
+
+// 狀態
+display.print(F(” |”));
+
+// 運動狀態圖示
+if(motionState == MOVING_UP) {
+display.print(F(” ^UP”));
+} else if(motionState == MOVING_DOWN) {
+display.print(F(” vDN”));
+} else {
+display.print(F(” –”));
+}
+
+// 警告
+if(tiltWarning) {
+display.setCursor(100, 54);
+display.print(F(“TILT”));
+} else if(currentSystemState != RUNNING) {
+display.setCursor(100, 54);
+display.print(F(“LOCK”));
+}
+
+display.display();
+}
+
+void drawDetailScreen() {
+display.clearDisplay();
+display.setTextColor(SSD1306_WHITE);
+
+display.setTextSize(3);
+display.setCursor(5, 5);
+display.print(currentSpeed, 1);
+display.setTextSize(1);
+display.setCursor(90, 15);
+display.print(F(“km/h”));
+
+display.setTextSize(2);
+display.setCursor(5, 32);
+display.print(F(“A:”));
+display.print(compAngleX, 1);
+
+display.setTextSize(1);
+display.setCursor(5, 54);
+
+// 狀態文字
+if(motionState == MOVING_UP) display.print(F(“MOVING UP  “));
+else if(motionState == MOVING_DOWN) display.print(F(“MOVING DOWN”));
+else display.print(F(“STOPPED    “));
+
+// PWM 值
+display.setCursor(90, 54);
+display.print(targetPWM);
+
+display.display();
+}
+
+// ============================================================================
+// 紅外線控制
+// ============================================================================
+void handleIRCommand(uint32_t code) {
+if(millis() - lastIRCode > IR_DELAY) {
+lastIRCode = millis();
+
+```
+wheelDown = !wheelDown;
+manualMode = true;
+ctrlSrc = 2;
+
+beepStart(NOTE_A5, 50);
+```
+
+}
+}
+
+// ============================================================================
+// 運動控制核心（防當機關鍵）
+// ============================================================================
+void executeMotion() {
+// 讀取磁簧狀態（LOW = 觸發到位）
+bool limitUpTriggered = (digitalRead(LIMIT_UP_PIN) == LOW);
+bool limitDownTriggered = (digitalRead(LIMIT_DOWN_PIN) == LOW);
+
+// 【狀態機控制】清楚的三態邏輯
+switch(motionState) {
+
+```
+// ========== 狀態 1: 停止中 ==========
+case IDLE:
+  // 只有在 RUNNING 狀態才允許啟動
+  if(currentSystemState == RUNNING) {
+    
+    // 判斷 1: 需要下降且未到下限
+    if(wheelDown && !limitDownTriggered) {
+      motionState = MOVING_DOWN;
+      digitalWrite(RELAY_PIN, LOW);  // 繼電器設定下降方向
+      Serial.println(F(">>> START DOWN"));
+    }
+    // 判斷 2: 需要上升且未到上限
+    else if(!wheelDown && !limitUpTriggered) {
+      motionState = MOVING_UP;
+      digitalWrite(RELAY_PIN, HIGH);  // 繼電器設定上升方向
+      Serial.println(F(">>> START UP"));
+    }
+    // 判斷 3: 已經在目標位置，不動作
+    else {
+      Serial.println(F("Already at target"));
+    }
+  }
+  targetPWM = 0;  // 停止時 PWM = 0
+  break;
+  
+// ========== 狀態 2: 上升中 ==========
+case MOVING_UP:
+  // 檢查是否到達上限
+  if(limitUpTriggered) {
+    // 到位！立即停止
+    motionState = IDLE;
+    targetPWM = 0;
+    ctrlSrc = 1;
+    beepStart(NOTE_C6, 50);
+    Serial.println(F("<<< UP LIMIT OK"));
+  } 
+  // 檢查是否目標改變（臨時想下降）
+  else if(wheelDown) {
+    // 目標改變，先停止再重新判斷
+    motionState = IDLE;
+    targetPWM = 0;
+    Serial.println(F("<<< UP ABORT"));
+  }
+  else {
+    // 繼續上升，輸出 PWM
+    int potValue = analogRead(SPEED_POT_PIN);
+    targetPWM = map(potValue, 0, 1023, 100, 255);
+  }
+  break;
+  
+// ========== 狀態 3: 下降中 ==========
+case MOVING_DOWN:
+  // 檢查是否到達下限
+  if(limitDownTriggered) {
+    // 到位！立即停止
+    motionState = IDLE;
+    targetPWM = 0;
+    ctrlSrc = 1;
+    beepStart(NOTE_G5, 50);
+    Serial.println(F("<<< DOWN LIMIT OK"));
+  }
+  // 檢查是否目標改變（臨時想上升）
+  else if(!wheelDown) {
+    // 目標改變，先停止再重新判斷
+    motionState = IDLE;
+    targetPWM = 0;
+    Serial.println(F("<<< DOWN ABORT"));
+  }
+  else {
+    // 繼續下降，輸出 PWM
+    int potValue = analogRead(SPEED_POT_PIN);
+    targetPWM = map(potValue, 0, 1023, 100, 255);
+  }
+  break;
+```
+
+}
+
+// 【安全檢查】任何異常立即停止 PWM
+if(currentSystemState != RUNNING) {
+targetPWM = 0;
+motionState = IDLE;
+}
+
+// 【統一輸出】所有 PWM 輸出都在這裡
+analogWrite(PWM_CONTROL_PIN, targetPWM);
+}
+
+// ============================================================================
+// Setup
+// ============================================================================
+void setup() {
+Serial.begin(115200);
+delay(100);
+
+Wire.begin();
+Wire.setClock(100000);
+
+pinMode(BUZZER_PIN, OUTPUT);
+pinMode(RELAY_PIN, OUTPUT);
+pinMode(LIMIT_UP_PIN, INPUT_PULLUP);
+pinMode(LIMIT_DOWN_PIN, INPUT_PULLUP);
+pinMode(HALL_SPEED_PIN, INPUT_PULLUP);
+pinMode(EMERGENCY_STOP_PIN, INPUT_PULLUP);
+pinMode(PWM_CONTROL_PIN, OUTPUT);
+pinMode(RGB_RED_PIN, OUTPUT);
+pinMode(RGB_GREEN_PIN, OUTPUT);
+pinMode(RGB_BLUE_PIN, OUTPUT);
+
+digitalWrite(RELAY_PIN, LOW);
+analogWrite(PWM_CONTROL_PIN, 0);
+setRGBColor(RGB_OFF);
+
+IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
+attachInterrupt(digitalPinToInterrupt(HALL_SPEED_PIN), speedInterrupt, FALLING);
+
+if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+Serial.println(F(“OLED Fail”));
+while(1);
+}
+
+ina226.init();
+setupMPU();
+calibrateIMU();
+
+showStartupPro();
+beepStart(NOTE_C6, 100);
+
+Serial.println(F(”=== v4.3 READY ===”));
+lastLoopTime = millis();
+}
+
+// ============================================================================
+// Loop - 主程式（防當機設計）
+// ============================================================================
+void loop() {
+uint32_t currentMillis = millis();
+
+// ========== 看門狗（防當機核心機制）==========
+if(currentMillis - lastLoopTime > WATCHDOG_TIMEOUT) {
+Serial.println(F(””));
+Serial.println(F(”!!!!!!!!!!!!!!!!!!!!!!!!”));
+Serial.println(F(”!!! WATCHDOG RESET !!!”));
+Serial.println(F(”!!!!!!!!!!!!!!!!!!!!!!!!”));
+
+```
+// 強制安全狀態
+motionState = IDLE;
+currentSystemState = RUNNING;
+targetPWM = 0;
+analogWrite(PWM_CONTROL_PIN, 0);
+digitalWrite(RELAY_PIN, LOW);
+
+// 重置控制變數
+tiltWarning = false;
+manualMode = false;
+
+// 發出警告音
+beepStart(NOTE_A5, 300);
+```
+
+}
+lastLoopTime = currentMillis;
+
+// ========== 非阻塞音效更新 ==========
+beepUpdate();
+
+// ========== 讀取感測器 ==========
+float ax, gx;
+readIMU(ax, gx);
+
+current_A = ina226.getCurrent_A();
+if(isnan(current_A)) current_A = 0.0;
+
+if(newSpeedData) {
+currentSpeed = calculateSpeed();
+newSpeedData = false;
+lastSpeedUpdate = millis();
+}
+
+if(millis() - lastSpeedUpdate > SPEED_TIMEOUT) {
+currentSpeed = 0.0;
+}
+
+// ========== 紅外線 ==========
+if(IrReceiver.decode()) {
+handleIRCommand(IrReceiver.decodedIRData.decodedRawData);
+IrReceiver.resume();
+}
+
+// ========== 緊急停止檢查 ==========
+bool emergencyStop = false;
+if(!IGNORE_CURRENT_SENSOR && current_A > MAX_CURRENT_A) {
+emergencyStop = true;
+}
+
+if(emergencyStop && currentSystemState == RUNNING) {
+currentSystemState = COOLING_DOWN;
+haltTime = currentMillis;
+motionState = IDLE;
+targetPWM = 0;
+analogWrite(PWM_CONTROL_PIN, 0);
+beepStart(NOTE_C6, 200);
+Serial.println(F(“EMERGENCY!”));
+}
+
+// ========== 冷卻恢復 ==========
+if(currentSystemState == COOLING_DOWN) {
+if(currentMillis - haltTime >= RESTART_DELAY_MS) {
+currentSystemState = RUNNING;
+Serial.println(F(“RECOVERED”));
+}
+}
+
+// ========== 傾斜保護 ==========
+if(currentSystemState == RUNNING) {
+if(abs(compAngleX) > EMERGENCY_ANGLE) {
+currentSystemState = EMERGENCY;
+motionState = IDLE;
+targetPWM = 0;
+wheelDown = true;  // 強制下降
+Serial.println(F(“EMERG TILT!”));
+}
+else if(abs(compAngleX) > SAFE_ANGLE) {
+if(tiltStartTime == 0) tiltStartTime = millis();
+
+```
+  if(!tiltWarning && (millis() - tiltStartTime >= TILT_TRIGGER_TIME)) {
+    tiltWarning = true;
+    wheelDown = true;
+    manualMode = false;
+    ctrlSrc = 4;
+    Serial.println(F("TILT WARN"));
+  }
+} else {
+  tiltStartTime = 0;
+  
+  if(tiltWarning && abs(compAngleX) < TILT_SAFE) {
+    if(safeStartTime == 0) safeStartTime = millis();
+    
+    if(millis() - safeStartTime >= AUTO_UP_DELAY) {
+      tiltWarning = false;
+      if(!manualMode) wheelDown = false;
+      Serial.println(F("TILT OK"));
+    }
+  } else {
+    safeStartTime = 0;
+  }
+}
+```
+
+}
+
+// ========== 自動速度控制 ==========
+if(currentSystemState == RUNNING && !manualMode && !tiltWarning) {
+if(currentSpeed < SPEED_THRESHOLD && !wheelDown) {
+wheelDown = true;
+ctrlSrc = 3;
+} else if(currentSpeed >= SPEED_THRESHOLD && wheelDown) {
+wheelDown = false;
+ctrlSrc = 3;
+}
+}
+
+// ========== 執行運動控制 ==========
+executeMotion();
+
+// ========== RGB 顯示 ==========
+setRGBColor(decideRGB());
+
+// ========== OLED 更新 ==========
+if(millis() - lastDisplayTime > 200) {
+lastDisplayTime = millis();
+
+```
+int displayMode = (millis() / 5000) % 2;
+if(displayMode == 0) drawDashboard();
+else drawDetailScreen();
+```
+
+}
+
+// ========== 序列埠輸出（詳細除錯）==========
+if(millis() - lastPrintTime > 1000) {
+lastPrintTime = millis();
+
+```
+// 主要狀態
+Serial.print(F("Sys:"));
+if(currentSystemState == RUNNING) Serial.print(F("RUN"));
+else if(currentSystemState == COOLING_DOWN) Serial.print(F("COOL"));
+else Serial.print(F("EMRG"));
+
+Serial.print(F(" |Motion:"));
+if(motionState == MOVING_UP) Serial.print(F("^UP^"));
+else if(motionState == MOVING_DOWN) Serial.print(F("vDNv"));
+else Serial.print(F("IDLE"));
+
+Serial.print(F(" |Target:"));
+Serial.print(wheelDown ? F("DN") : F("UP"));
+
+// 磁簧狀態
+Serial.print(F(" |LimUP:"));
+Serial.print(digitalRead(LIMIT_UP_PIN) == LOW ? F("ON") : F("--"));
+Serial.print(F(" |LimDN:"));
+Serial.print(digitalRead(LIMIT_DOWN_PIN) == LOW ? F("ON") : F("--"));
+
+// 速度與角度
+Serial.print(F(" |Spd:"));
+Serial.print(currentSpeed, 1);
+Serial.print(F(" |Ang:"));
+Serial.print(compAngleX, 1);
+
+// PWM 輸出
+Serial.print(F(" |PWM:"));
+Serial.print(targetPWM);
+
+// 電流
+Serial.print(F(" |I:"));
+Serial.print(current_A, 2);
+Serial.print(F("A"));
+
+// 警告標記
+if(tiltWarning) Serial.print(F(" [TILT!]"));
+if(manualMode) Serial.print(F(" [MANUAL]"));
+
+// 控制來源
+Serial.print(F(" Src:"));
+switch(ctrlSrc) {
+  case 0: Serial.print(F("--")); break;
+  case 1: Serial.print(F("LIM")); break;
+  case 2: Serial.print(F("IR")); break;
+  case 3: Serial.print(F("AUTO")); break;
+  case 4: Serial.print(F("TILT")); break;
+}
+
+Serial.println();
+```
+
+}
+
+// 小延遲防止 CPU 滿載
+delay(5);
+}
