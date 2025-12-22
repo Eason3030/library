@@ -1,15 +1,16 @@
 // ============================================================================
-// 自行車輔助輪智能控制系統 v4.3 - 防當機版
+// 自行車輔助輪智能控制系統 v4.5 - 往復式致動器版
 //
-// 【核心設計原則】
-// 1. PWM = 唯一啟停手段（不控制方向）
-// 2. 繼電器 = 方向切換（HIGH=上升, LOW=下降）
-// 3. 磁簧開關 = 行程限位保護
-// 4. 霍爾感測器 = 僅測速
-// 5. 非阻塞設計 = 防止當機
+// 【硬體說明】
+// - Gearwell 往復式線性致動器（12V 15rpm）
+// - 馬達單向持續旋轉 → 凸輪推杆上下往復
+// - PWM 控制轉速（ON=旋轉, OFF=停止）
+// - 磁簧開關偵測上/下限「甜蜜點」
 //
-// 【狀態機邏輯】
-// IDLE → 接收指令 → 設定方向 → MOVING_UP/DOWN → 觸發磁簧 → IDLE
+// 【控制邏輯】
+// 1. 需要上升 → PWM ON → 馬達轉 → 推杆上升 → 上限磁簧觸發 → PWM OFF
+// 2. 需要下降 → PWM ON → 馬達轉 → 推杆下降 → 下限磁簧觸發 → PWM OFF
+// 3. 冷卻模式 → 5 秒鎖定 → 自動解除
 // ============================================================================
 
 #include <Wire.h>
@@ -265,7 +266,7 @@ display.setCursor(15,10);
 display.print(F(“BIKE”));
 display.setCursor(10,40);
 display.setTextSize(2);
-display.print(F(“v4.3”));
+display.print(F(“v4.5”));
 display.display();
 delay(1000);
 }
@@ -380,103 +381,105 @@ beepStart(NOTE_A5, 50);
 }
 
 // ============================================================================
-// 運動控制核心（防當機關鍵）
+// 運動控制核心（往復式致動器專用）
 // ============================================================================
 void executeMotion() {
-// 讀取磁簧狀態（LOW = 觸發到位）
+// 讀取磁簧狀態
 bool limitUpTriggered = (digitalRead(LIMIT_UP_PIN) == LOW);
 bool limitDownTriggered = (digitalRead(LIMIT_DOWN_PIN) == LOW);
 
-// 【狀態機控制】清楚的三態邏輯
+// 磁簧觸發檢查（只有在運動中才鎖定）
+if(limitUpTriggered && !limitUpLocked && motionState == MOVING_UP) {
+limitUpLocked = true;
+motionState = IDLE;
+ctrlSrc = 1;
+beepStart(NOTE_C6, 50);
+Serial.println(F(”<<< UP LIMIT (甜蜜點)”));
+}
+
+if(limitDownTriggered && !limitDownLocked && motionState == MOVING_DOWN) {
+limitDownLocked = true;
+motionState = IDLE;
+ctrlSrc = 1;
+beepStart(NOTE_G5, 50);
+Serial.println(F(”<<< DOWN LIMIT (甜蜜點)”));
+}
+
+// 狀態機
 switch(motionState) {
 
 ```
-// ========== 狀態 1: 停止中 ==========
+// ========== IDLE：停止狀態 ==========
 case IDLE:
-  // 只有在 RUNNING 狀態才允許啟動
   if(currentSystemState == RUNNING) {
     
-    // 判斷 1: 需要下降且未到下限
-    if(wheelDown && !limitDownTriggered) {
+    // 需要下降且未到下限
+    if(wheelDown && !limitDownLocked) {
       motionState = MOVING_DOWN;
-      digitalWrite(RELAY_PIN, LOW);  // 繼電器設定下降方向
-      Serial.println(F(">>> START DOWN"));
+      Serial.println(F(">>> START DOWN (馬達啟動)"));
     }
-    // 判斷 2: 需要上升且未到上限
-    else if(!wheelDown && !limitUpTriggered) {
+    // 需要上升且未到上限
+    else if(!wheelDown && !limitUpLocked) {
       motionState = MOVING_UP;
-      digitalWrite(RELAY_PIN, HIGH);  // 繼電器設定上升方向
-      Serial.println(F(">>> START UP"));
-    }
-    // 判斷 3: 已經在目標位置，不動作
-    else {
-      Serial.println(F("Already at target"));
+      Serial.println(F(">>> START UP (馬達啟動)"));
     }
   }
-  targetPWM = 0;  // 停止時 PWM = 0
+  targetPWM = 0;  // 停止時馬達不轉
   break;
   
-// ========== 狀態 2: 上升中 ==========
+// ========== MOVING_UP：上升中 ==========
 case MOVING_UP:
-  // 檢查是否到達上限
-  if(limitUpTriggered) {
-    // 到位！立即停止
+  // 檢查是否已到上限或目標改變
+  if(limitUpLocked) {
     motionState = IDLE;
     targetPWM = 0;
-    ctrlSrc = 1;
-    beepStart(NOTE_C6, 50);
-    Serial.println(F("<<< UP LIMIT OK"));
-  } 
-  // 檢查是否目標改變（臨時想下降）
+    Serial.println(F("<<< UP COMPLETE"));
+  }
   else if(wheelDown) {
-    // 目標改變，先停止再重新判斷
+    // 目標改變為下降，重新開始
     motionState = IDLE;
     targetPWM = 0;
-    Serial.println(F("<<< UP ABORT"));
+    Serial.println(F("<<< UP ABORT (目標改變)"));
   }
   else {
-    // 繼續上升，輸出 PWM
+    // 馬達持續旋轉，推杆上升
     int potValue = analogRead(SPEED_POT_PIN);
-    targetPWM = map(potValue, 0, 1023, 100, 255);
+    targetPWM = map(potValue, 0, 1023, 120, 255);  // 最小 120（避免啟動不良）
   }
   break;
   
-// ========== 狀態 3: 下降中 ==========
+// ========== MOVING_DOWN：下降中 ==========
 case MOVING_DOWN:
-  // 檢查是否到達下限
-  if(limitDownTriggered) {
-    // 到位！立即停止
+  // 檢查是否已到下限或目標改變
+  if(limitDownLocked) {
     motionState = IDLE;
     targetPWM = 0;
-    ctrlSrc = 1;
-    beepStart(NOTE_G5, 50);
-    Serial.println(F("<<< DOWN LIMIT OK"));
+    Serial.println(F("<<< DOWN COMPLETE"));
   }
-  // 檢查是否目標改變（臨時想上升）
   else if(!wheelDown) {
-    // 目標改變，先停止再重新判斷
+    // 目標改變為上升，重新開始
     motionState = IDLE;
     targetPWM = 0;
-    Serial.println(F("<<< DOWN ABORT"));
+    Serial.println(F("<<< DOWN ABORT (目標改變)"));
   }
   else {
-    // 繼續下降，輸出 PWM
+    // 馬達持續旋轉，推杆下降
     int potValue = analogRead(SPEED_POT_PIN);
-    targetPWM = map(potValue, 0, 1023, 100, 255);
+    targetPWM = map(potValue, 0, 1023, 120, 255);
   }
   break;
 ```
 
 }
 
-// 【安全檢查】任何異常立即停止 PWM
-if(currentSystemState != RUNNING) {
-targetPWM = 0;
+// 緊急安全：COOLING_DOWN 強制停止
+if(currentSystemState == COOLING_DOWN) {
 motionState = IDLE;
+targetPWM = 0;
 }
 
-// 【統一輸出】所有 PWM 輸出都在這裡
-analogWrite(PWM_CONTROL_PIN, targetPWM);
+// 統一輸出 PWM
+analogWrite(PWM_MOTOR_PIN, targetPWM);
 }
 
 // ============================================================================
@@ -519,7 +522,10 @@ calibrateIMU();
 showStartupPro();
 beepStart(NOTE_C6, 100);
 
-Serial.println(F(”=== v4.3 READY ===”));
+Serial.println(F(”============================”));
+Serial.println(F(”  BIKE ASSIST v4.5 READY”));
+Serial.println(F(”  往復式致動器專用版”));
+Serial.println(F(”============================”));
 lastLoopTime = millis();
 }
 
