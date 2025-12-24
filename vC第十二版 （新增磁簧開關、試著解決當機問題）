@@ -1,16 +1,19 @@
 // ============================================================================
-// 自行車輔助輪智能控制系統 v4.5 - 往復式致動器版
+// 自行車輔助輪智能控制系統 v4.6 - 往復式致動器完整修正版
 //
 // 【硬體說明】
 // - Gearwell 往復式線性致動器（12V 15rpm）
 // - 馬達單向持續旋轉 → 凸輪推杆上下往復
 // - PWM 控制轉速（ON=旋轉, OFF=停止）
+// - 繼電器切換方向（HIGH=上升, LOW=下降）
 // - 磁簧開關偵測上/下限「甜蜜點」
 //
-// 【控制邏輯】
-// 1. 需要上升 → PWM ON → 馬達轉 → 推杆上升 → 上限磁簧觸發 → PWM OFF
-// 2. 需要下降 → PWM ON → 馬達轉 → 推杆下降 → 下限磁簧觸發 → PWM OFF
-// 3. 冷卻模式 → 5 秒鎖定 → 自動解除
+// 【v4.6 主要改進】
+// ✅ 修正限位鎖定邏輯 - 智能解鎖機制
+// ✅ 新增馬達運轉超時保護（10秒）
+// ✅ PWM 軟啟動功能（減少機械衝擊）
+// ✅ I2C 加速至 400kHz
+// ✅ 優化狀態轉換邏輯
 // ============================================================================
 
 #include <Wire.h>
@@ -32,6 +35,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 // ============================================================================
 const bool BUTTON_IS_NC_TYPE = true;
 const bool IGNORE_CURRENT_SENSOR = true;
+const uint32_t MOTOR_TIMEOUT = 10000;  // 🆕 馬達運轉超時（10秒）
 
 // ============================================================================
 // 音符定義
@@ -127,9 +131,12 @@ bool wheelDown = false;         // 目標狀態
 bool manualMode = false;
 byte ctrlSrc = 0;               // 0=無, 1=磁簧, 2=IR, 3=自動, 4=傾斜
 
-// 限位鎖定變數（🔧 新增）
+// 🔧 限位鎖定變數（修正版）
 bool limitUpLocked = false;     // 上限鎖定
 bool limitDownLocked = false;   // 下限鎖定
+
+// 🆕 馬達超時保護
+uint32_t motorStartTime = 0;
 
 // 時間控制
 uint32_t haltTime = 0;
@@ -147,8 +154,10 @@ bool isBeeping = false;
 uint32_t lastLoopTime = 0;
 const uint32_t WATCHDOG_TIMEOUT = 2000;
 
-// PWM 目標值
+// 🆕 PWM 軟啟動
 int targetPWM = 0;
+int currentPWM = 0;
+const int PWM_STEP = 8;  // 軟啟動步進值
 
 // ============================================================================
 // RGB LED 控制
@@ -186,7 +195,7 @@ RGBColor decideRGB() {
 }
 
 // ============================================================================
-// 非阻塞音效（不使用 delay）
+// 非阻塞音效
 // ============================================================================
 void beepStart(uint16_t freq, uint16_t duration) {
   tone(BUZZER_PIN, freq);
@@ -270,7 +279,7 @@ void showStartupPro() {
   display.print(F("BIKE"));
   display.setCursor(10,40);
   display.setTextSize(2);
-  display.print(F("v4.5"));
+  display.print(F("v4.6"));
   display.display();
   delay(1000);
 }
@@ -361,25 +370,19 @@ void drawDetailScreen() {
   
   // PWM 值
   display.setCursor(90, 54);
-  display.print(targetPWM);
+  display.print(currentPWM);
   
   display.display();
 }
 
 // ============================================================================
-// 紅外線控制
+// 紅外線控制（修正版 - 移除手動解鎖）
 // ============================================================================
 void handleIRCommand(uint32_t code) {
   if(millis() - lastIRCode > IR_DELAY) {
     lastIRCode = millis();
     
-    // 🔧 解除限位鎖定
-    if(limitUpLocked || limitDownLocked) {
-      limitUpLocked = false;
-      limitDownLocked = false;
-      Serial.println(F("IR: Unlock limits"));
-    }
-    
+    // 切換目標狀態
     wheelDown = !wheelDown;
     manualMode = true;
     ctrlSrc = 2;
@@ -387,73 +390,107 @@ void handleIRCommand(uint32_t code) {
     beepStart(NOTE_A5, 50);
     Serial.print(F("IR: Target "));
     Serial.println(wheelDown ? F("DOWN") : F("UP"));
+    
+    // ✅ 智能解鎖會自動處理，不需要手動解鎖
   }
 }
 
 // ============================================================================
-// 運動控制核心（往復式致動器專用 - 完整修正版）
+// 🆕 PWM 軟啟動函式
+// ============================================================================
+void smoothPWM() {
+  if(currentPWM < targetPWM) {
+    currentPWM = min(currentPWM + PWM_STEP, targetPWM);
+  } else if(currentPWM > targetPWM) {
+    currentPWM = max(currentPWM - PWM_STEP, targetPWM);
+  }
+  
+  analogWrite(PWM_CONTROL_PIN, currentPWM);
+}
+
+// ============================================================================
+// 🔧 運動控制核心（往復式致動器完整修正版 v4.6）
 // ============================================================================
 void executeMotion() {
-  // 讀取磁簧狀態
+  // 1️⃣ 讀取磁簧開關狀態
   bool limitUpTriggered = (digitalRead(LIMIT_UP_PIN) == LOW);
   bool limitDownTriggered = (digitalRead(LIMIT_DOWN_PIN) == LOW);
   
-  // 磁簧觸發檢查（只有在運動中才鎖定）
-  if(limitUpTriggered && !limitUpLocked && motionState == MOVING_UP) {
-    limitUpLocked = true;
-    motionState = IDLE;
-    ctrlSrc = 1;
-    beepStart(NOTE_C6, 50);
-    Serial.println(F("<<< UP LIMIT"));
+  // 2️⃣ 智能解鎖：當目標方向改變時，自動解除對應的限位鎖定
+  if (wheelDown && limitUpLocked) {
+    limitUpLocked = false;
+    Serial.println(F("🔓 Auto-unlock UP (target→DOWN)"));
   }
   
-  if(limitDownTriggered && !limitDownLocked && motionState == MOVING_DOWN) {
-    limitDownLocked = true;
-    motionState = IDLE;
-    ctrlSrc = 1;
-    beepStart(NOTE_G5, 50);
-    Serial.println(F("<<< DOWN LIMIT"));
+  if (!wheelDown && limitDownLocked) {
+    limitDownLocked = false;
+    Serial.println(F("🔓 Auto-unlock DOWN (target→UP)"));
   }
   
-  // 狀態機
+  // 3️⃣ 馬達運轉超時保護
+  if(motionState != IDLE) {
+    if(motorStartTime == 0) {
+      motorStartTime = millis();
+    }
+    
+    if(millis() - motorStartTime > MOTOR_TIMEOUT) {
+      Serial.println(F(""));
+      Serial.println(F("⚠️ ============================="));
+      Serial.println(F("⚠️  MOTOR TIMEOUT! (10 sec)"));
+      Serial.println(F("⚠️  磁簧開關可能故障或未對準"));
+      Serial.println(F("⚠️ ============================="));
+      
+      currentSystemState = EMERGENCY;
+      motionState = IDLE;
+      targetPWM = 0;
+      beepStart(NOTE_A5, 300);
+      motorStartTime = 0;
+      return;
+    }
+  } else {
+    motorStartTime = 0;  // 重置計時器
+  }
+  
+  // 4️⃣ 狀態機核心邏輯
   switch(motionState) {
     
     // ========== IDLE：停止狀態 ==========
     case IDLE:
       if(currentSystemState == RUNNING) {
         
-        // 需要下降且未到下限
-        if(wheelDown && !limitDownLocked) {
-          // 🔧 切換方向繼電器
-          digitalWrite(RELAY_PIN, LOW);   // 下降方向
+        // 需要下降 且 (未觸發下限 且 下限未鎖定)
+        if(wheelDown && !limitDownTriggered && !limitDownLocked) {
+          digitalWrite(RELAY_PIN, LOW);   // 設定下降方向
           motionState = MOVING_DOWN;
-          limitDownLocked = false;        // 🔧 解除鎖定，允許運動
           Serial.println(F(">>> START DOWN"));
         }
-        // 需要上升且未到上限
-        else if(!wheelDown && !limitUpLocked) {
-          // 🔧 切換方向繼電器
-          digitalWrite(RELAY_PIN, HIGH);  // 上升方向
+        
+        // 需要上升 且 (未觸發上限 且 上限未鎖定)
+        else if(!wheelDown && !limitUpTriggered && !limitUpLocked) {
+          digitalWrite(RELAY_PIN, HIGH);  // 設定上升方向
           motionState = MOVING_UP;
-          limitUpLocked = false;          // 🔧 解除鎖定，允許運動
           Serial.println(F(">>> START UP"));
         }
       }
-      targetPWM = 0;
+      targetPWM = 0;  // 停止時 PWM = 0
       break;
       
     // ========== MOVING_UP：上升中 ==========
     case MOVING_UP:
-      if(limitUpLocked) {
+      // 到達上限
+      if(limitUpTriggered) {
+        limitUpLocked = true;  // 鎖定上限
         motionState = IDLE;
-        targetPWM = 0;
-        Serial.println(F("<<< UP COMPLETE"));
+        ctrlSrc = 1;
+        beepStart(NOTE_C6, 50);
+        Serial.println(F("<<< UP LIMIT REACHED ✓"));
       }
+      // 目標改變（使用者要求下降）
       else if(wheelDown) {
         motionState = IDLE;
-        targetPWM = 0;
-        Serial.println(F("<<< UP ABORT"));
+        Serial.println(F("<<< UP ABORT (target changed)"));
       }
+      // 正常運轉
       else {
         int potValue = analogRead(SPEED_POT_PIN);
         targetPWM = map(potValue, 0, 1023, 120, 255);
@@ -462,16 +499,20 @@ void executeMotion() {
       
     // ========== MOVING_DOWN：下降中 ==========
     case MOVING_DOWN:
-      if(limitDownLocked) {
+      // 到達下限
+      if(limitDownTriggered) {
+        limitDownLocked = true;  // 鎖定下限
         motionState = IDLE;
-        targetPWM = 0;
-        Serial.println(F("<<< DOWN COMPLETE"));
+        ctrlSrc = 1;
+        beepStart(NOTE_G5, 50);
+        Serial.println(F("<<< DOWN LIMIT REACHED ✓"));
       }
+      // 目標改變（使用者要求上升）
       else if(!wheelDown) {
         motionState = IDLE;
-        targetPWM = 0;
-        Serial.println(F("<<< DOWN ABORT"));
+        Serial.println(F("<<< DOWN ABORT (target changed)"));
       }
+      // 正常運轉
       else {
         int potValue = analogRead(SPEED_POT_PIN);
         targetPWM = map(potValue, 0, 1023, 120, 255);
@@ -479,14 +520,14 @@ void executeMotion() {
       break;
   }
   
-  // 緊急停止
+  // 5️⃣ 緊急停止強制覆蓋
   if(currentSystemState != RUNNING) {
     motionState = IDLE;
     targetPWM = 0;
   }
   
-  // 🔧 修正：統一輸出 PWM
-  analogWrite(PWM_CONTROL_PIN, targetPWM);
+  // 6️⃣ 輸出 PWM（軟啟動版本）
+  smoothPWM();
 }
 
 // ============================================================================
@@ -497,7 +538,7 @@ void setup() {
   delay(100);
   
   Wire.begin();
-  Wire.setClock(100000);
+  Wire.setClock(400000);  // 🆕 I2C 加速至 400kHz
   
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(RELAY_PIN, OUTPUT);
@@ -529,15 +570,23 @@ void setup() {
   showStartupPro();
   beepStart(NOTE_C6, 100);
   
-  Serial.println(F("============================"));
-  Serial.println(F("  BIKE ASSIST v4.5 READY"));
-  Serial.println(F("  往復式致動器專用版"));
-  Serial.println(F("============================"));
+  Serial.println(F(""));
+  Serial.println(F("===================================="));
+  Serial.println(F("  🚴 BIKE ASSIST v4.6 READY 🚴"));
+  Serial.println(F("  往復式致動器完整修正版"));
+  Serial.println(F("===================================="));
+  Serial.println(F("✅ 智能解鎖機制"));
+  Serial.println(F("✅ 馬達超時保護 (10秒)"));
+  Serial.println(F("✅ PWM 軟啟動"));
+  Serial.println(F("✅ I2C 400kHz 加速"));
+  Serial.println(F("===================================="));
+  Serial.println(F(""));
+  
   lastLoopTime = millis();
 }
 
 // ============================================================================
-// Loop - 主程式（防當機設計）
+// Loop - 主程式
 // ============================================================================
 void loop() {
   uint32_t currentMillis = millis();
@@ -553,12 +602,14 @@ void loop() {
     motionState = IDLE;
     currentSystemState = RUNNING;
     targetPWM = 0;
+    currentPWM = 0;
     analogWrite(PWM_CONTROL_PIN, 0);
     digitalWrite(RELAY_PIN, LOW);
     
     // 重置控制變數
     tiltWarning = false;
     manualMode = false;
+    motorStartTime = 0;
     
     // 發出警告音
     beepStart(NOTE_A5, 300);
@@ -602,16 +653,17 @@ void loop() {
     haltTime = currentMillis;
     motionState = IDLE;
     targetPWM = 0;
+    currentPWM = 0;
     analogWrite(PWM_CONTROL_PIN, 0);
     beepStart(NOTE_C6, 200);
-    Serial.println(F("EMERGENCY!"));
+    Serial.println(F("⚠️ EMERGENCY! Over-current"));
   }
   
   // ========== 冷卻恢復 ==========
   if(currentSystemState == COOLING_DOWN) {
     if(currentMillis - haltTime >= RESTART_DELAY_MS) {
       currentSystemState = RUNNING;
-      Serial.println(F("RECOVERED"));
+      Serial.println(F("✓ RECOVERED from cooling"));
     }
   }
   
@@ -622,7 +674,7 @@ void loop() {
       motionState = IDLE;
       targetPWM = 0;
       wheelDown = true;  // 強制下降
-      Serial.println(F("EMERG TILT!"));
+      Serial.println(F("🚨 EMERGENCY TILT!"));
     }
     else if(abs(compAngleX) > SAFE_ANGLE) {
       if(tiltStartTime == 0) tiltStartTime = millis();
@@ -632,7 +684,7 @@ void loop() {
         wheelDown = true;
         manualMode = false;
         ctrlSrc = 4;
-        Serial.println(F("TILT WARN"));
+        Serial.println(F("⚠️ TILT WARNING"));
       }
     } else {
       tiltStartTime = 0;
@@ -643,7 +695,7 @@ void loop() {
         if(millis() - safeStartTime >= AUTO_UP_DELAY) {
           tiltWarning = false;
           if(!manualMode) wheelDown = false;
-          Serial.println(F("TILT OK"));
+          Serial.println(F("✓ TILT SAFE"));
         }
       } else {
         safeStartTime = 0;
@@ -677,7 +729,7 @@ void loop() {
     else drawDetailScreen();
   }
   
-  // ========== 序列埠輸出（詳細除錯）==========
+  // ========== 序列埠輸出 ==========
   if(millis() - lastPrintTime > 1000) {
     lastPrintTime = millis();
     
@@ -695,11 +747,14 @@ void loop() {
     Serial.print(F(" |Target:"));
     Serial.print(wheelDown ? F("DN") : F("UP"));
     
-    // 磁簧狀態
+    // 磁簧狀態與鎖定狀態
     Serial.print(F(" |LimUP:"));
     Serial.print(digitalRead(LIMIT_UP_PIN) == LOW ? F("ON") : F("--"));
+    if(limitUpLocked) Serial.print(F("[L]"));
+    
     Serial.print(F(" |LimDN:"));
     Serial.print(digitalRead(LIMIT_DOWN_PIN) == LOW ? F("ON") : F("--"));
+    if(limitDownLocked) Serial.print(F("[L]"));
     
     // 速度與角度
     Serial.print(F(" |Spd:"));
@@ -707,14 +762,23 @@ void loop() {
     Serial.print(F(" |Ang:"));
     Serial.print(compAngleX, 1);
     
-    // PWM 輸出
+    // PWM 輸出（軟啟動版本）
     Serial.print(F(" |PWM:"));
+    Serial.print(currentPWM);
+    Serial.print(F("/"));
     Serial.print(targetPWM);
     
     // 電流
     Serial.print(F(" |I:"));
     Serial.print(current_A, 2);
     Serial.print(F("A"));
+    
+    // 馬達運轉時間
+    if(motorStartTime > 0) {
+      Serial.print(F(" |MotT:"));
+      Serial.print((millis() - motorStartTime)/1000);
+      Serial.print(F("s"));
+    }
     
     // 警告標記
     if(tiltWarning) Serial.print(F(" [TILT!]"));
