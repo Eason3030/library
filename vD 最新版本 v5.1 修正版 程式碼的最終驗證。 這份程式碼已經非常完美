@@ -1,13 +1,11 @@
 // ============================================================================
-// 自行車輔助輪智能控制系統 v5.0 - 自動往返馬達版
+// 自行車輔助輪智能控制系統 v5.1 - 自動往返馬達版（修正版）
 // 
-// 【主要更新】
-// ✅ 支援自動往返型線性制動器（通電/斷電控制）
-// ✅ 四個磁簧開關同步限位監控
-// ✅ 飛機起降式速度控制 (20km/h UP, 15km/h DOWN)
-// ✅ 馬達相位追蹤與方向管理
-// ✅ 手動重置機制（移除自動恢復）
-// ✅ 完整診斷模式
+// 【v5.1 更新】
+// ✅ 移除不必要的馬達相位追蹤邏輯
+// ✅ 簡化 executeMotion() - 直接根據目標和限位開關控制
+// ✅ 修正 runDiagnostics() 的阻塞問題
+// ✅ 保留所有安全機制（手動重置、去彈跳等）
 // ============================================================================
 
 #include <Wire.h>
@@ -29,8 +27,8 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 // 系統設定
 // ============================================================================
 const bool BUTTON_IS_NC_TYPE = true;
-const bool IGNORE_CURRENT_SENSOR = false;  // 建議啟用電流保護
-const bool ENABLE_DIAGNOSTICS = false;     // 設為 true 啟動診斷模式
+const bool IGNORE_CURRENT_SENSOR = false;
+const bool ENABLE_DIAGNOSTICS = false;  // 設為 true 啟動診斷模式
 
 // ============================================================================
 // 音符定義
@@ -53,10 +51,9 @@ const bool ENABLE_DIAGNOSTICS = false;     // 設為 true 啟動診斷模式
 // 腳位定義
 // ============================================================================
 const byte BUZZER_PIN = 8;
-const byte MOTOR_POWER_PIN = 11;  // 馬達通電控制（原 RELAY_PIN）
+const byte MOTOR_POWER_PIN = 11;
 const byte IR_RECEIVE_PIN = 3;
 
-// 四個磁簧開關腳位
 const byte LIMIT_LEFT_UP_PIN = 4;
 const byte LIMIT_LEFT_DOWN_PIN = 10;
 const byte LIMIT_RIGHT_UP_PIN = 13;
@@ -64,8 +61,8 @@ const byte LIMIT_RIGHT_DOWN_PIN = A1;
 
 const byte HALL_SPEED_PIN = 2;
 const byte EMERGENCY_STOP_PIN = 12;
-const byte RESET_BUTTON_PIN = A2;  // 新增：手動重置按鈕
-const byte SPEED_POT_PIN = A0;     // 保留但不用於速度調整
+const byte RESET_BUTTON_PIN = A2;
+const byte SPEED_POT_PIN = A0;
 
 const byte RGB_RED_PIN = 5;
 const byte RGB_GREEN_PIN = 7;
@@ -79,16 +76,7 @@ const bool RGB_COMMON_ANODE = false;
 enum MotionState : byte {
   IDLE,
   MOVING_UP,
-  MOVING_DOWN,
-  WAITING_REVERSE  // 新增：等待馬達換向
-};
-
-enum MotorPhase : byte {
-  PHASE_UNKNOWN,
-  PHASE_EXTENDING,    // 正在伸出（放下）
-  PHASE_RETRACTING,   // 正在縮回（收起）
-  PHASE_AT_DOWN,      // 已在下限
-  PHASE_AT_UP         // 已在上限
+  MOVING_DOWN
 };
 
 enum ControlPriority : byte {
@@ -103,7 +91,7 @@ enum SystemState : byte {
   RUNNING,
   COOLING_DOWN,
   EMERGENCY,
-  DIAGNOSTICS  // 新增：診斷模式
+  DIAGNOSTICS
 };
 
 enum RGBColor : byte {
@@ -113,7 +101,7 @@ enum RGBColor : byte {
   RGB_BLUE,
   RGB_RED,
   RGB_PURPLE,
-  RGB_CYAN     // 新增：診斷模式用
+  RGB_CYAN
 };
 
 // ============================================================================
@@ -121,11 +109,10 @@ enum RGBColor : byte {
 // ============================================================================
 
 INA226_WE ina226;
-const float MAX_CURRENT_A = 5.0;  // 請根據馬達規格調整
+const float MAX_CURRENT_A = 5.0;
 float current_A = 0.0;
 
 MotionState motionState = IDLE;
-MotorPhase currentPhase = PHASE_UNKNOWN;
 SystemState currentSystemState = RUNNING;
 ControlPriority currentPriority = PRIORITY_AUTO;
 
@@ -133,11 +120,9 @@ ControlPriority currentPriority = PRIORITY_AUTO;
 bool motorPowerOn = false;
 uint32_t motorStartTime = 0;
 const uint32_t MAX_MOTOR_RUN_TIME = 30000;  // 30秒超時保護
-uint32_t lastPhaseChangeTime = 0;
-const uint16_t MIN_PHASE_DURATION = 500;    // 防止相位抖動
 
 // 速度測量
-#define WHEEL_CIRCUMFERENCE 204.2  // 請根據實際輪胎周長(cm)調整
+#define WHEEL_CIRCUMFERENCE 204.2
 const uint16_t SPEED_TIMEOUT = 2000;
 volatile uint32_t lastSpeedTrigger = 0;
 volatile uint32_t timeBetweenTriggers = 0;
@@ -145,7 +130,7 @@ volatile bool newSpeedData = false;
 float currentSpeed = 0.0;
 uint32_t lastSpeedUpdate = 0;
 
-// IMU 資料與健康狀態
+// IMU 資料
 float compAngleX = 0.0f;
 float gyroBiasX = 0.0f;
 float accelBiasX = 0.0f;
@@ -164,7 +149,7 @@ uint32_t tiltStartTime = 0;
 bool tiltWarning = false;
 uint32_t safeStartTime = 0;
 
-// 速度防抖與遲滯
+// 速度防抖
 const byte SPEED_STABLE_COUNT = 3;
 byte speedLowCount = 0;
 byte speedHighCount = 0;
@@ -172,11 +157,11 @@ const float SPEED_UP_THRESHOLD = 20.0;
 const float SPEED_DOWN_THRESHOLD = 15.0;
 
 // 控制變數
-bool wheelDown = true;  // 預設輔助輪放下（安全狀態）
+bool wheelDown = true;
 bool manualMode = false;
 byte ctrlSrc = 0;
 
-// 限位開關狀態記錄（用於去彈跳）
+// 限位開關狀態
 struct LimitSwitchState {
   bool current;
   bool lastStable;
@@ -189,9 +174,9 @@ LimitSwitchState limitLeftDown;
 LimitSwitchState limitRightUp;
 LimitSwitchState limitRightDown;
 
-// 緊急停止狀態
+// 緊急停止
 bool emergencyStopPressed = false;
-bool manualResetConfirmed = false;  // 手動重置確認
+bool manualResetConfirmed = false;
 uint32_t haltTime = 0;
 
 // 時間控制
@@ -207,6 +192,11 @@ bool isBeeping = false;
 // 看門狗
 uint32_t lastLoopTime = 0;
 const uint32_t WATCHDOG_TIMEOUT = 2000;
+
+// 診斷模式變數
+uint32_t diagStartTime = 0;
+byte diagPhase = 0;
+const uint16_t DIAG_PHASE_DURATION = 5000;
 
 // ============================================================================
 // RGB LED 控制
@@ -291,7 +281,7 @@ float calculateSpeed() {
 }
 
 // ============================================================================
-// MPU6050 函式 - 安全版本
+// MPU6050 函式
 // ============================================================================
 
 int16_t safeRead16(byte reg) {
@@ -365,11 +355,11 @@ void readIMU() {
 }
 
 // ============================================================================
-// 限位開關處理（帶去彈跳）
+// 限位開關處理
 // ============================================================================
 
 bool readLimitSwitch(LimitSwitchState &state, byte pin) {
-  bool reading = (digitalRead(pin) == LOW);  // 假設為常開型，觸發時為LOW
+  bool reading = (digitalRead(pin) == LOW);
   
   if (reading != state.current) {
     state.lastChangeTime = millis();
@@ -379,7 +369,7 @@ bool readLimitSwitch(LimitSwitchState &state, byte pin) {
   if (millis() - state.lastChangeTime > state.debounceTime) {
     if (reading != state.lastStable) {
       state.lastStable = reading;
-      return true;  // 狀態已改變且穩定
+      return true;
     }
   }
   
@@ -402,40 +392,6 @@ bool isFullyDown() {
 }
 
 // ============================================================================
-// 馬達相位追蹤
-// ============================================================================
-
-void updateMotorPhase() {
-  MotorPhase oldPhase = currentPhase;
-  
-  // 根據限位開關判斷當前位置
-  if (isFullyDown()) {
-    currentPhase = PHASE_AT_DOWN;
-  } else if (isFullyUp()) {
-    currentPhase = PHASE_AT_UP;
-  } else if (motorPowerOn) {
-    // 馬達運行中，根據目標方向判斷
-    if (motionState == MOVING_DOWN) {
-      currentPhase = PHASE_EXTENDING;
-    } else if (motionState == MOVING_UP) {
-      currentPhase = PHASE_RETRACTING;
-    }
-  }
-  
-  // 記錄相位變化時間（防抖用）
-  if (oldPhase != currentPhase) {
-    lastPhaseChangeTime = millis();
-    
-    #if defined(DEBUG_MOTOR_PHASE)
-    Serial.print(F("Phase: "));
-    Serial.print(oldPhase);
-    Serial.print(F(" -> "));
-    Serial.println(currentPhase);
-    #endif
-  }
-}
-
-// ============================================================================
 // OLED 顯示
 // ============================================================================
 
@@ -447,7 +403,7 @@ void showStartupPro() {
   display.print(F("BIKE"));
   display.setCursor(10,40);
   display.setTextSize(2);
-  display.print(F("v5.0"));
+  display.print(F("v5.1"));
   display.display();
   delay(1000);
 }
@@ -508,7 +464,6 @@ void drawDashboard() {
   if(tiltWarning) display.print(F("TILT!"));
   else if(manualMode) display.print(F("MANUAL"));
   else if(!i2cHealthy) display.print(F("I2C ERR"));
-  else if(currentPhase == PHASE_UNKNOWN) display.print(F("PH:UNK"));
   else display.print(F("OK"));
 
   // 限位開關狀態
@@ -538,7 +493,6 @@ void handleIRCommand(uint32_t code) {
     return;
   }
 
-  // 切換目標狀態
   wheelDown = !wheelDown;
   manualMode = true;
   ctrlSrc = 2;
@@ -647,70 +601,152 @@ void executeByPriority() {
 }
 
 // ============================================================================
-// 運動控制核心（針對自動往返馬達）
+// 運動控制核心（簡化版 - 針對自動往返馬達）
 // ============================================================================
 
 void executeMotion() {
-  // 更新馬達相位
-  updateMotorPhase();
+  // 1. 非 RUNNING 狀態：立即停止馬達
+  if (currentSystemState != RUNNING) {
+    if (motorPowerOn) {
+      motorPowerOn = false;
+      digitalWrite(MOTOR_POWER_PIN, LOW);
+      motionState = IDLE;
+      Serial.println(F("<<< MOTOR OFF (Non-Running State)"));
+    }
+    return;
+  }
   
-  // 超時保護
+  // 2. 超時保護
   if (motorPowerOn && (millis() - motorStartTime > MAX_MOTOR_RUN_TIME)) {
     motorPowerOn = false;
     digitalWrite(MOTOR_POWER_PIN, LOW);
-  motorPowerOn = false;
-  Serial.println(F("\n馬達已停止"));
-  
-  Serial.println(F("\n等待 3 秒後再次測試..."));
-  delay(3000);
-  
-  Serial.println(F("馬達再次通電 5 秒（觀察方向是否改變）..."));
-  digitalWrite(MOTOR_POWER_PIN, HIGH);
-  motorPowerOn = true;
-  
-  for (int i = 5; i > 0; i--) {
-    Serial.print(i);
-    Serial.print(F("..."));
-    beepStart(NOTE_A5, 100);
-    delay(1000);
+    motionState = IDLE;
+    
+    currentSystemState = COOLING_DOWN;
+    haltTime = millis();
+    
+    Serial.println(F("!!! MOTOR TIMEOUT !!!"));
+    beepStart(NOTE_C6, 500);
+    return;
   }
   
-  digitalWrite(MOTOR_POWER_PIN, LOW);
-  motorPowerOn = false;
-  Serial.println(F("\n馬達已停止"));
+  // 3. 判斷是否需要通電（簡化邏輯）
+  bool shouldRun = false;
   
-  // 3. 感測器狀態
-  Serial.println(F("\n=== 感測器狀態 ==="));
-  readIMU();
-  Serial.print(F("角度: "));
-  Serial.print(compAngleX, 2);
-  Serial.println(F(" 度"));
-  Serial.print(F("I2C 健康: "));
-  Serial.println(i2cHealthy ? F("OK") : F("FAIL"));
-  Serial.print(F("電流: "));
-  Serial.print(current_A, 2);
-  Serial.println(F(" A"));
+  if (wheelDown) {
+    // 目標：放下輔助輪
+    if (!isFullyDown()) {
+      shouldRun = true;
+      motionState = MOVING_DOWN;
+    } else {
+      motionState = IDLE;
+    }
+  } else {
+    // 目標：收起輔助輪
+    if (!isFullyUp()) {
+      shouldRun = true;
+      motionState = MOVING_UP;
+    } else {
+      motionState = IDLE;
+    }
+  }
   
-  Serial.println(F("\n=== 診斷完成 ==="));
-  Serial.println(F("按下重置按鈕恢復正常模式\n"));
+  // 4. 執行動作
+  if (shouldRun && !motorPowerOn) {
+    // 啟動馬達
+    motorPowerOn = true;
+    digitalWrite(MOTOR_POWER_PIN, HIGH);
+    motorStartTime = millis();
+    Serial.println(F(">>> MOTOR ON"));
+  } else if (!shouldRun && motorPowerOn) {
+    // 停止馬達（已到位）
+    motorPowerOn = false;
+    digitalWrite(MOTOR_POWER_PIN, LOW);
+    Serial.println(F("<<< MOTOR OFF (Target Reached)"));
+    
+    if (motionState == IDLE) {
+      beepStart(NOTE_E5, 100);
+    }
+  }
+}
+
+// ============================================================================
+// 診斷模式（非阻塞版本）
+// ============================================================================
+
+void runDiagnostics() {
+  uint32_t elapsed = millis() - diagStartTime;
   
-  // 等待重置
-  while (!manualResetConfirmed) {
+  // 相位0：限位開關測試（10秒）
+  if (diagPhase == 0) {
+    if (elapsed % 500 < 250) {
+      setRGBColor(RGB_CYAN);
+    } else {
+      setRGBColor(RGB_OFF);
+    }
+    
+    if (elapsed % 1000 < 50) {  // 每秒輸出一次
+      Serial.print(F("左上:"));
+      Serial.print(isLimitTriggered(LIMIT_LEFT_UP_PIN, limitLeftUp) ? F("[X]") : F("[ ]"));
+      Serial.print(F(" 左下:"));
+      Serial.print(isLimitTriggered(LIMIT_LEFT_DOWN_PIN, limitLeftDown) ? F("[X]") : F("[ ]"));
+      Serial.print(F(" 右上:"));
+      Serial.print(isLimitTriggered(LIMIT_RIGHT_UP_PIN, limitRightUp) ? F("[X]") : F("[ ]"));
+      Serial.print(F(" 右下:"));
+      Serial.println(isLimitTriggered(LIMIT_RIGHT_DOWN_PIN, limitRightDown) ? F("[X]") : F("[ ]"));
+    }
+    
+    if (elapsed > 10000) {
+      diagPhase = 1;
+      diagStartTime = millis();
+      Serial.println(F("\n=== 馬達測試開始 ==="));
+      digitalWrite(MOTOR_POWER_PIN, HIGH);
+      beepStart(NOTE_C5, 100);
+    }
+  }
+  
+  // 相位1：馬達測試（5秒）
+  else if (diagPhase == 1) {
+    setRGBColor(RGB_YELLOW);
+    
+    if (elapsed > DIAG_PHASE_DURATION) {
+      digitalWrite(MOTOR_POWER_PIN, LOW);
+      diagPhase = 2;
+      diagStartTime = millis();
+      Serial.println(F("\n=== 感測器狀態 ==="));
+    }
+  }
+  
+  // 相位2：感測器狀態顯示（持續直到重置）
+  else if (diagPhase == 2) {
+    if (elapsed % 500 < 250) {
+      setRGBColor(RGB_CYAN);
+    } else {
+      setRGBColor(RGB_OFF);
+    }
+    
+    if (elapsed % 2000 < 50) {  // 每2秒輸出一次
+      readIMU();
+      Serial.print(F("角度: "));
+      Serial.print(compAngleX, 2);
+      Serial.print(F(" | I2C: "));
+      Serial.print(i2cHealthy ? F("OK") : F("FAIL"));
+      Serial.print(F(" | 電流: "));
+      Serial.print(current_A, 2);
+      Serial.println(F("A"));
+    }
+    
+    // 檢查重置按鈕
     if (digitalRead(RESET_BUTTON_PIN) == LOW) {
       delay(50);
       if (digitalRead(RESET_BUTTON_PIN) == LOW) {
-        manualResetConfirmed = true;
+        currentSystemState = RUNNING;
+        diagPhase = 0;
         beepStart(NOTE_C6, 200);
+        Serial.println(F("\n<<< 診斷結束，恢復正常模式 >>>"));
       }
     }
-    setRGBColor(RGB_CYAN);
-    delay(100);
-    setRGBColor(RGB_OFF);
-    delay(100);
   }
-  
-  currentSystemState = RUNNING;
-  manualResetConfirmed = false;
 }
 
 // ============================================================================
@@ -762,8 +798,8 @@ void setup() {
   beepStart(NOTE_C6, 100);
 
   Serial.println(F("============================"));
-  Serial.println(F("  BIKE ASSIST v5.0"));
-  Serial.println(F("  自動往返馬達版"));
+  Serial.println(F("  BIKE ASSIST v5.1"));
+  Serial.println(F("  簡化版（自動往返馬達）"));
   Serial.println(F("============================"));
 
   // 系統診斷
@@ -800,7 +836,11 @@ void setup() {
 
   // 如果啟用診斷模式
   if (ENABLE_DIAGNOSTICS) {
-    runDiagnostics();
+    currentSystemState = DIAGNOSTICS;
+    diagStartTime = millis();
+    diagPhase = 0;
+    Serial.println(F("\n>>> 診斷模式啟動 <<<"));
+    Serial.println(F("請手動觸發各個磁簧開關..."));
   }
 
   lastI2CSuccess = millis();
@@ -818,6 +858,14 @@ void loop() {
   wdt_reset();
   uint32_t currentMillis = millis();
 
+  // ========== 診斷模式處理 ==========
+  if (currentSystemState == DIAGNOSTICS) {
+    runDiagnostics();
+    beepUpdate();
+    delay(2);
+    return;  // 診斷模式中不執行其他邏輯
+  }
+
   // ========== 看門狗 ==========
   if(currentMillis - lastLoopTime > WATCHDOG_TIMEOUT) {
     Serial.println(F("!!! WATCHDOG RESET !!!"));
@@ -827,7 +875,6 @@ void loop() {
     motionState = IDLE;
     currentSystemState = RUNNING;
     currentPriority = PRIORITY_AUTO;
-    currentPhase = PHASE_UNKNOWN;
     tiltWarning = false;
     manualMode = false;
     speedLowCount = 0;
@@ -912,7 +959,7 @@ void loop() {
   // ========== 手動重置檢查 ==========
   if (currentSystemState == COOLING_DOWN) {
     if (digitalRead(RESET_BUTTON_PIN) == LOW) {
-      delay(50);  // 簡單去彈跳
+      delay(50);
       if (digitalRead(RESET_BUTTON_PIN) == LOW) {
         manualResetConfirmed = true;
       }
@@ -999,17 +1046,7 @@ void loop() {
     Serial.print(F(" |Motion:"));
     if(motionState == MOVING_UP) Serial.print(F("^UP^"));
     else if(motionState == MOVING_DOWN) Serial.print(F("vDNv"));
-    else if(motionState == WAITING_REVERSE) Serial.print(F("WAIT"));
     else Serial.print(F("IDLE"));
-
-    Serial.print(F(" |Phase:"));
-    switch(currentPhase) {
-      case PHASE_UNKNOWN: Serial.print(F("UNK")); break;
-      case PHASE_EXTENDING: Serial.print(F("EXT")); break;
-      case PHASE_RETRACTING: Serial.print(F("RET")); break;
-      case PHASE_AT_DOWN: Serial.print(F("@DN")); break;
-      case PHASE_AT_UP: Serial.print(F("@UP")); break;
-    }
 
     Serial.print(F(" |Target:"));
     Serial.print(wheelDown ? F("DN") : F("UP"));
@@ -1057,129 +1094,4 @@ void loop() {
   }
 
   delay(2);
-} LOW);
-    
-    currentSystemState = COOLING_DOWN;
-    haltTime = millis();
-    
-    Serial.println(F("!!! MOTOR TIMEOUT !!!"));
-    beepStart(NOTE_C6, 500);
-    return;
-  }
-  
-  // 只有在 RUNNING 狀態才能移動
-  if (currentSystemState != RUNNING) {
-    if (motorPowerOn) {
-      motorPowerOn = false;
-      digitalWrite(MOTOR_POWER_PIN, LOW);
-      motionState = IDLE;
-    }
-    return;
-  }
-  
-  // ========== 決策邏輯 ==========
-  bool shouldRun = false;
-  MotionState desiredState = IDLE;
-  
-  if (wheelDown) {
-    // 目標：放下輔助輪
-    if (isFullyDown()) {
-      // 已經在下限，停止
-      desiredState = IDLE;
-    } else {
-      // 需要移動
-      if (currentPhase == PHASE_AT_UP || currentPhase == PHASE_EXTENDING) {
-        // 在上限或正在伸出 → 可以通電
-        shouldRun = true;
-        desiredState = MOVING_DOWN;
-      } else if (currentPhase == PHASE_RETRACTING) {
-        // 馬達正在縮回（錯誤方向）→ 等待到達上限後自動換向
-        desiredState = WAITING_REVERSE;
-        Serial.println(F("Waiting for motor to reach top..."));
-      }
-    }
-  } else {
-    // 目標：收起輔助輪
-    if (isFullyUp()) {
-      // 已經在上限，停止
-      desiredState = IDLE;
-    } else {
-      // 需要移動
-      if (currentPhase == PHASE_AT_DOWN || currentPhase == PHASE_RETRACTING) {
-        // 在下限或正在縮回 → 可以通電
-        shouldRun = true;
-        desiredState = MOVING_UP;
-      } else if (currentPhase == PHASE_EXTENDING) {
-        // 馬達正在伸出（錯誤方向）→ 等待到達下限後自動換向
-        desiredState = WAITING_REVERSE;
-        Serial.println(F("Waiting for motor to reach bottom..."));
-      }
-    }
-  }
-  
-  // ========== 執行動作 ==========
-  motionState = desiredState;
-  
-  if (shouldRun && !motorPowerOn) {
-    // 啟動馬達
-    motorPowerOn = true;
-    digitalWrite(MOTOR_POWER_PIN, HIGH);
-    motorStartTime = millis();
-    Serial.println(F(">>> MOTOR ON"));
-  } else if (!shouldRun && motorPowerOn) {
-    // 停止馬達
-    motorPowerOn = false;
-    digitalWrite(MOTOR_POWER_PIN, LOW);
-    Serial.println(F("<<< MOTOR OFF"));
-    
-    // 到位提示音
-    if (desiredState == IDLE) {
-      beepStart(NOTE_E5, 100);
-    }
-  }
 }
-
-// ============================================================================
-// 診斷模式
-// ============================================================================
-
-void runDiagnostics() {
-  currentSystemState = DIAGNOSTICS;
-  Serial.println(F("\n========================================"));
-  Serial.println(F("        診斷模式啟動"));
-  Serial.println(F("========================================\n"));
-  
-  // 1. 限位開關測試
-  Serial.println(F("=== 限位開關測試 (10秒) ==="));
-  Serial.println(F("請手動觸發每個磁簧開關..."));
-  
-  for (int i = 0; i < 20; i++) {
-    Serial.print(F("左上:"));
-    Serial.print(isLimitTriggered(LIMIT_LEFT_UP_PIN, limitLeftUp) ? F("[X]") : F("[ ]"));
-    Serial.print(F(" 左下:"));
-    Serial.print(isLimitTriggered(LIMIT_LEFT_DOWN_PIN, limitLeftDown) ? F("[X]") : F("[ ]"));
-    Serial.print(F(" 右上:"));
-    Serial.print(isLimitTriggered(LIMIT_RIGHT_UP_PIN, limitRightUp) ? F("[X]") : F("[ ]"));
-    Serial.print(F(" 右下:"));
-    Serial.println(isLimitTriggered(LIMIT_RIGHT_DOWN_PIN, limitRightDown) ? F("[X]") : F("[ ]"));
-    
-    setRGBColor(RGB_CYAN);
-    delay(500);
-  }
-  
-  // 2. 馬達測試
-  Serial.println(F("\n=== 馬達行為測試 ==="));
-  Serial.println(F("馬達將通電 5 秒..."));
-  
-  digitalWrite(MOTOR_POWER_PIN, HIGH);
-  motorPowerOn = true;
-  motorStartTime = millis();
-  
-  for (int i = 5; i > 0; i--) {
-    Serial.print(i);
-    Serial.print(F("..."));
-    beepStart(NOTE_C5, 100);
-    delay(1000);
-  }
-  
-  digitalWrite(MOTOR_POWER_PIN,
