@@ -46,7 +46,7 @@ const bool IGNORE_CURRENT_SENSOR = true;
 // ============================================================================
 // MPU6050 設定
 // ============================================================================
-#define MPU_6050 0x68
+#define MPU_6050 0x69
 #define PWR_MGMT_1 0x6B
 #define ACCEL_XOUT_H 0x3B
 #define GYRO_XOUT_H  0x43
