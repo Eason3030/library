@@ -1,0 +1,38 @@
+// ============================================================================
+// 磁簧開關(限位開關) 診斷測試程式
+// 用途：確認磁簧開關的接線、觸發邏輯(NO/NC)與穩定性
+// ============================================================================
+
+const byte LIMIT_UP_PIN = 52;   // 上限位
+const byte LIMIT_DOWN_PIN = 53; // 下限位
+
+void setup() {
+  Serial.begin(115200);
+  
+  // 使用內部上拉電阻，假設開關另一端接地
+  pinMode(LIMIT_UP_PIN, INPUT_PULLUP);
+  pinMode(LIMIT_DOWN_PIN, INPUT_PULLUP);
+  
+  Serial.println(F("========================================"));
+  Serial.println(F("磁簧開關測試開始..."));
+  Serial.println(F("請手動觸發開關，觀察數值變化"));
+  Serial.println(F("邏輯說明："));
+  Serial.println(F("  0: 代表腳位偵測到 LOW (通常是開關閉合)"));
+  Serial.println(F("  1: 代表腳位偵測到 HIGH (通常是開關斷開)"));
+  Serial.println(F("========================================"));
+}
+
+void loop() {
+  int upVal = digitalRead(LIMIT_UP_PIN);
+  int downVal = digitalRead(LIMIT_DOWN_PIN);
+  
+  Serial.print(F("上限位(Pin 52): "));
+  Serial.print(upVal);
+  Serial.print(upVal == LOW ? F(" [觸發!]") : F(" [未觸發]"));
+  
+  Serial.print(F("  |  下限位(Pin 53): "));
+  Serial.print(downVal);
+  Serial.println(downVal == LOW ? F(" [觸發!]") : F(" [未觸發]"));
+  
+  delay(200); // 降低輸出頻率方便觀察
+}
