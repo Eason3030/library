@@ -1,10 +1,12 @@
 // ============================================================================
-// 雙致動器智能控制系統 v6.1 - 限位保護修正版
+// 雙致動器智能控制系統 v7.0 - 完整修正版
 // 主要改進:
-// 1. 最高優先權硬體限位保護
-// 2. 統一 PWM 控制入口
-// 3. 完整的雙致動器中斷處理
-// 4. 簡化狀態機邏輯
+// 1. 修正限位開關檢測邏輯 (移除不支援的中斷腳位)
+// 2. 完整音效系統 (5種獨立音效)
+// 3. 單致動器測試模式 (只啟用左側 Pin 52/53)
+// 4. 優化 OLED 介面顯示
+// 5. 修正速度閾值為 15 km/h
+// 6. 簡化同步邏輯
 // ============================================================================
 
 #include <Wire.h>
@@ -26,16 +28,20 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 // 系統設定
 // ============================================================================
 const bool BUTTON_IS_NC_TYPE = true;
-const bool IGNORE_CURRENT_SENSOR = false;
+const bool IGNORE_CURRENT_SENSOR = true;  // 暫時停用電流檢測
+const bool SINGLE_ACTUATOR_TEST = true;   // 單致動器測試模式
 
 // ============================================================================
-// 音符定義
+// 音符定義 - 完整音效系統
 // ============================================================================
+#define NOTE_C4  262
+#define NOTE_E4  330
+#define NOTE_G4  392
 #define NOTE_C5  523
 #define NOTE_E5  659
 #define NOTE_G5  784
-#define NOTE_C6  1047
 #define NOTE_A5  880
+#define NOTE_C6  1047
 
 // ============================================================================
 // MPU6050 設定
@@ -52,11 +58,11 @@ const byte BUZZER_PIN = 8;
 const byte IR_RECEIVE_PIN = 3;
 const byte PWM_PIN = 9;
 
-// 致動器 1 (左側) 限位開關
+// 致動器 1 (左側) 限位開關 - 測試中
 const byte LIMIT_LEFT_UP_PIN = 52;
 const byte LIMIT_LEFT_DOWN_PIN = 53;
 
-// 致動器 2 (右側) 限位開關
+// 致動器 2 (右側) 限位開關 - 暫時保留
 const byte LIMIT_RIGHT_UP_PIN = 13;
 const byte LIMIT_RIGHT_DOWN_PIN = A1;
 
@@ -101,7 +107,22 @@ enum RGBColor : byte {
   RGB_BLUE,
   RGB_RED,
   RGB_PURPLE,
-  RGB_CYAN
+  RGB_CYAN,
+  RGB_WHITE
+};
+
+// ============================================================================
+// 音效類型定義
+// ============================================================================
+enum SoundEffect : byte {
+  SOUND_NONE,
+  SOUND_INIT_COMPLETE,    // 初始化完成
+  SOUND_RISING,           // 開始上升
+  SOUND_FALLING,          // 開始下降
+  SOUND_BUTTON,           // 按鈕/IR
+  SOUND_TILT_WARNING,     // 傾斜警告
+  SOUND_LIMIT_REACHED,    // 到達限位
+  SOUND_EMERGENCY         // 緊急停止
 };
 
 // ============================================================================
@@ -110,12 +131,15 @@ enum RGBColor : byte {
 struct ActuatorStatus {
   bool upLimitPressed;
   bool downLimitPressed;
+  bool upLimitPrevious;      // 前一次狀態
+  bool downLimitPrevious;    // 前一次狀態
   uint32_t lastChangeTime;
   uint16_t debounceTime;
+  bool isActive;             // 是否啟用此致動器
 };
 
-ActuatorStatus actuator1 = {false, false, 0, 50};
-ActuatorStatus actuator2 = {false, false, 0, 50};
+ActuatorStatus actuator1 = {false, false, false, false, 0, 50, true};   // 左側 - 測試中
+ActuatorStatus actuator2 = {false, false, false, false, 0, 50, false};  // 右側 - 暫停
 
 // ============================================================================
 // 全域變數
@@ -131,10 +155,10 @@ ControlPriority currentPriority = PRIORITY_AUTO;
 // 同步控制
 bool bothAtBottom = false;
 bool bothAtTop = false;
-bool anyAtTop = false;        // 新增: 任一到頂
-bool anyAtBottom = false;      // 新增: 任一到底
+bool anyAtTop = false;
+bool anyAtBottom = false;
 unsigned long syncTimeout = 0;
-const unsigned long SYNC_TIMEOUT_MS = 3000;
+const unsigned long SYNC_TIMEOUT_MS = 10000;  // 10秒超時保護
 
 // PWM 控制
 int pwmSpeedUp = 200;
@@ -169,12 +193,12 @@ uint32_t tiltStartTime = 0;
 bool tiltWarning = false;
 uint32_t safeStartTime = 0;
 
-// 速度控制
+// 速度控制 - 修正為 15 km/h
 const byte SPEED_STABLE_COUNT = 3;
 byte speedLowCount = 0;
 byte speedHighCount = 0;
-const float SPEED_UP_THRESHOLD = 20.0;
-const float SPEED_DOWN_THRESHOLD = 15.0;
+const float SPEED_UP_THRESHOLD = 15.0;      // 修正: 15 km/h 上升
+const float SPEED_DOWN_THRESHOLD = 10.0;    // 10 km/h 下降
 const float SPEED_MIN_SAFE = 5.0;
 
 // 控制變數
@@ -195,7 +219,16 @@ uint32_t lastDisplayTime = 0;
 uint32_t lastIRCode = 0;
 const uint16_t IR_DELAY = 500;
 
-// 非阻塞音效
+// 非阻塞音效 - 增強版
+struct BeepQueue {
+  uint16_t frequency;
+  uint16_t duration;
+  uint16_t pause;
+  bool active;
+};
+
+BeepQueue beepQueue[3];
+byte beepIndex = 0;
 uint32_t beepEndTime = 0;
 bool isBeeping = false;
 
@@ -203,14 +236,13 @@ bool isBeeping = false;
 uint32_t lastLoopTime = 0;
 const uint32_t WATCHDOG_TIMEOUT = 2000;
 
-// ============================================================================
-// 中斷服務程序 - 硬體限位最高優先權
-// ============================================================================
-void emergencyStopPWM_ISR() {
-  analogWrite(PWM_PIN, 0);
-  // 不在中斷中改變狀態,交由主迴圈處理
-}
+// OLED 動畫
+byte animFrame = 0;
+uint32_t lastAnimTime = 0;
 
+// ============================================================================
+// 中斷服務程序
+// ============================================================================
 void speedInterrupt() {
   uint32_t t = micros();
   if (t - lastSpeedTrigger > 40000) {
@@ -239,11 +271,12 @@ void setRGBColor(RGBColor c) {
   switch(c) {
     case RGB_OFF: setRGB(0,0,0); break;
     case RGB_GREEN: setRGB(0,255,0); break;
-    case RGB_YELLOW: setRGB(255,255,0); break;
-    case RGB_BLUE: setRGB(0,0,255); break;
+    case RGB_YELLOW: setRGB(255,200,0); break;
+    case RGB_BLUE: setRGB(0,100,255); break;
     case RGB_RED: setRGB(255,0,0); break;
-    case RGB_PURPLE: setRGB(128,0,255); break;
+    case RGB_PURPLE: setRGB(180,0,255); break;
     case RGB_CYAN: setRGB(0,255,255); break;
+    case RGB_WHITE: setRGB(255,255,255); break;
   }
 }
 
@@ -259,23 +292,92 @@ RGBColor decideRGB() {
     default:
       if (currentState == STATE_RISING) return RGB_GREEN;
       if (currentState == STATE_FALLING) return RGB_YELLOW;
+      if (currentState == STATE_UP) return RGB_CYAN;
       return wheelDown ? RGB_YELLOW : RGB_GREEN;
   }
 }
 
 // ============================================================================
-// 非阻塞音效
+// 增強型音效系統
 // ============================================================================
-void beepStart(uint16_t freq, uint16_t duration) {
-  tone(BUZZER_PIN, freq);
-  beepEndTime = millis() + duration;
-  isBeeping = true;
+void playSound(SoundEffect sound) {
+  // 清空佇列
+  for(byte i = 0; i < 3; i++) {
+    beepQueue[i].active = false;
+  }
+  beepIndex = 0;
+  
+  switch(sound) {
+    case SOUND_INIT_COMPLETE:
+      beepQueue[0] = {NOTE_C5, 100, 50, true};
+      beepQueue[1] = {NOTE_E5, 100, 50, true};
+      beepQueue[2] = {NOTE_G5, 150, 0, true};
+      break;
+      
+    case SOUND_RISING:
+      beepQueue[0] = {NOTE_E5, 80, 30, true};
+      beepQueue[1] = {NOTE_G5, 80, 30, true};
+      beepQueue[2] = {NOTE_C6, 120, 0, true};
+      break;
+      
+    case SOUND_FALLING:
+      beepQueue[0] = {NOTE_G5, 80, 30, true};
+      beepQueue[1] = {NOTE_E5, 80, 30, true};
+      beepQueue[2] = {NOTE_C5, 120, 0, true};
+      break;
+      
+    case SOUND_BUTTON:
+      beepQueue[0] = {NOTE_A5, 50, 0, true};
+      break;
+      
+    case SOUND_TILT_WARNING:
+      beepQueue[0] = {NOTE_C6, 100, 50, true};
+      beepQueue[1] = {NOTE_C6, 100, 50, true};
+      beepQueue[2] = {NOTE_C6, 100, 0, true};
+      break;
+      
+    case SOUND_LIMIT_REACHED:
+      beepQueue[0] = {NOTE_G5, 100, 0, true};
+      break;
+      
+    case SOUND_EMERGENCY:
+      beepQueue[0] = {NOTE_C6, 200, 100, true};
+      beepQueue[1] = {NOTE_C6, 200, 0, true};
+      break;
+      
+    default:
+      return;
+  }
+  
+  // 開始播放第一個音符
+  if(beepQueue[0].active) {
+    tone(BUZZER_PIN, beepQueue[0].frequency);
+    beepEndTime = millis() + beepQueue[0].duration;
+    isBeeping = true;
+  }
 }
 
 void beepUpdate() {
-  if (isBeeping && millis() >= beepEndTime) {
+  if(!isBeeping) return;
+  
+  if(millis() >= beepEndTime) {
     noTone(BUZZER_PIN);
     isBeeping = false;
+    
+    // 播放下一個音符
+    if(beepQueue[beepIndex].pause > 0) {
+      beepEndTime = millis() + beepQueue[beepIndex].pause;
+      beepIndex++;
+    } else {
+      beepIndex++;
+    }
+    
+    if(beepIndex < 3 && beepQueue[beepIndex].active) {
+      delay(beepQueue[beepIndex-1].pause);
+      tone(BUZZER_PIN, beepQueue[beepIndex].frequency);
+      beepEndTime = millis() + beepQueue[beepIndex].duration;
+      isBeeping = true;
+    }
   }
 }
 
@@ -362,77 +464,89 @@ void readIMU() {
 }
 
 // ============================================================================
-// 限位開關處理(帶去彈跳)
+// 限位開關處理 - 輪詢模式 (移除中斷)
 // ============================================================================
 bool readLimitSwitch(byte pin, ActuatorStatus &actuator, bool isUp) {
+  if(!actuator.isActive) return false;
+  
   bool reading = (digitalRead(pin) == LOW);
   bool &current = isUp ? actuator.upLimitPressed : actuator.downLimitPressed;
+  bool &previous = isUp ? actuator.upLimitPrevious : actuator.downLimitPrevious;
   
-  if (reading != current) {
+  if (reading != previous) {
     actuator.lastChangeTime = millis();
+    previous = reading;
+  }
+  
+  if((millis() - actuator.lastChangeTime > actuator.debounceTime)) {
+    // 邊緣檢測: 從未觸發到觸發
+    if(reading && !current) {
+      current = true;
+      return true;  // 新觸發
+    }
     current = reading;
   }
   
-  return (millis() - actuator.lastChangeTime > actuator.debounceTime) && current;
+  return false;
 }
 
 void updateLimitSwitches() {
-  actuator1.upLimitPressed = readLimitSwitch(LIMIT_LEFT_UP_PIN, actuator1, true);
-  actuator1.downLimitPressed = readLimitSwitch(LIMIT_LEFT_DOWN_PIN, actuator1, false);
+  // 左側致動器 (測試中)
+  bool leftUpTriggered = readLimitSwitch(LIMIT_LEFT_UP_PIN, actuator1, true);
+  bool leftDownTriggered = readLimitSwitch(LIMIT_LEFT_DOWN_PIN, actuator1, false);
   
-  actuator2.upLimitPressed = readLimitSwitch(LIMIT_RIGHT_UP_PIN, actuator2, true);
-  actuator2.downLimitPressed = readLimitSwitch(LIMIT_RIGHT_DOWN_PIN, actuator2, false);
+  // 右側致動器 (暫停)
+  if(!SINGLE_ACTUATOR_TEST) {
+    readLimitSwitch(LIMIT_RIGHT_UP_PIN, actuator2, true);
+    readLimitSwitch(LIMIT_RIGHT_DOWN_PIN, actuator2, false);
+  }
   
-  // 更新同步狀態
-  bothAtBottom = actuator1.downLimitPressed && actuator2.downLimitPressed;
-  bothAtTop = actuator1.upLimitPressed && actuator2.upLimitPressed;
-  anyAtTop = actuator1.upLimitPressed || actuator2.upLimitPressed;
-  anyAtBottom = actuator1.downLimitPressed || actuator2.downLimitPressed;
+  // 單致動器測試模式
+  if(SINGLE_ACTUATOR_TEST) {
+    bothAtBottom = actuator1.downLimitPressed;
+    bothAtTop = actuator1.upLimitPressed;
+    anyAtTop = actuator1.upLimitPressed;
+    anyAtBottom = actuator1.downLimitPressed;
+  } else {
+    bothAtBottom = actuator1.downLimitPressed && actuator2.downLimitPressed;
+    bothAtTop = actuator1.upLimitPressed && actuator2.upLimitPressed;
+    anyAtTop = actuator1.upLimitPressed || actuator2.upLimitPressed;
+    anyAtBottom = actuator1.downLimitPressed || actuator2.downLimitPressed;
+  }
+  
+  // 觸發音效
+  if(leftUpTriggered || leftDownTriggered) {
+    playSound(SOUND_LIMIT_REACHED);
+  }
 }
 
 // ============================================================================
-// 【關鍵改進】最高優先權限位檢查 - 無條件硬停止
+// 限位檢查與 PWM 控制
 // ============================================================================
 void checkHardwareLimits() {
-  // 任一致動器觸及上限位 → 立即停止
-  if (anyAtTop) {
+  if (anyAtTop && currentState == STATE_RISING) {
     analogWrite(PWM_PIN, 0);
-    if (currentState == STATE_RISING) {
-      currentState = bothAtTop ? STATE_UP : STATE_RISING;
-    }
+    Serial.println(F("[限位] 上限觸發 - 停止"));
   }
   
-  // 任一致動器觸及下限位 → 立即停止
-  if (anyAtBottom) {
+  if (anyAtBottom && (currentState == STATE_FALLING || currentState == STATE_INIT)) {
     analogWrite(PWM_PIN, 0);
-    if (currentState == STATE_FALLING || currentState == STATE_INIT) {
-      currentState = bothAtBottom ? STATE_STANDBY : currentState;
-    }
+    Serial.println(F("[限位] 下限觸發 - 停止"));
   }
 }
 
-// ============================================================================
-// 【關鍵改進】統一 PWM 控制入口
-// ============================================================================
 void controlPWM(bool direction_up, int pwm_value) {
-  // 每次寫入 PWM 前先檢查限位
-  checkHardwareLimits();
-  
-  if (direction_up) {
-    // 上升方向: 任一到頂就不能再上升
-    if (anyAtTop) {
-      analogWrite(PWM_PIN, 0);
-    } else {
-      analogWrite(PWM_PIN, pwm_value);
-    }
-  } else {
-    // 下降方向: 任一到底就不能再下降
-    if (anyAtBottom) {
-      analogWrite(PWM_PIN, 0);
-    } else {
-      analogWrite(PWM_PIN, pwm_value);
-    }
+  if (direction_up && anyAtTop) {
+    analogWrite(PWM_PIN, 0);
+    return;
   }
+  
+  if (!direction_up && anyAtBottom) {
+    analogWrite(PWM_PIN, 0);
+    return;
+  }
+  
+  analogWrite(PWM_PIN, pwm_value);
 }
 
 void stopAllPWM() {
@@ -454,10 +568,10 @@ void readSpeedControl() {
   if (millis() - lastSpeedRead > 100) {
     lastSpeedRead = millis();
     int speedControlValue = analogRead(SPEED_CONTROL_PIN);
-    pwmSpeedUp = map(speedControlValue, 0, 1023, 50, 255);
-    pwmSpeedDown = map(speedControlValue, 0, 1023, 50, 220);
-    pwmSpeedUp = constrain(pwmSpeedUp, 50, 255);
-    pwmSpeedDown = constrain(pwmSpeedDown, 50, 220);
+    pwmSpeedUp = map(speedControlValue, 0, 1023, 80, 255);
+    pwmSpeedDown = map(speedControlValue, 0, 1023, 80, 220);
+    pwmSpeedUp = constrain(pwmSpeedUp, 80, 255);
+    pwmSpeedDown = constrain(pwmSpeedDown, 80, 220);
   }
 }
 
@@ -528,7 +642,7 @@ void executeByPriority() {
         previousState = currentState;
         currentState = STATE_EMERGENCY_STOP;
         haltTime = millis();
-        beepStart(NOTE_C6, 300);
+        playSound(SOUND_EMERGENCY);
         Serial.println(F("!!! 緊急停止觸發 !!!"));
       }
       break;
@@ -554,14 +668,14 @@ void executeByPriority() {
         if(wheelDown) {
           wheelDown = false;
           ctrlSrc = 3;
-          Serial.println(F("自動: 上升 (速度 >= 20km/h)"));
+          Serial.println(F("自動: 上升 (速度 >= 15km/h)"));
         }
       } 
       else if(currentSpeed < SPEED_DOWN_THRESHOLD && speedLowCount >= SPEED_STABLE_COUNT) {
         if(!wheelDown) {
           wheelDown = true;
           ctrlSrc = 3;
-          Serial.println(F("自動: 下降 (速度 < 15km/h)"));
+          Serial.println(F("自動: 下降 (速度 < 10km/h)"));
         }
       }
       break;
@@ -569,32 +683,33 @@ void executeByPriority() {
 }
 
 // ============================================================================
-// 【關鍵改進】狀態機核心邏輯 - 簡化且安全
+// 狀態機核心邏輯
 // ============================================================================
 void handleStateMachine() {
-  // 【最高優先權】每次進入狀態機先檢查硬體限位
   checkHardwareLimits();
   
   switch (currentState) {
     
     case STATE_INIT:
       if (!bothAtBottom) {
-        moveDown();  // 使用統一控制函式
+        moveDown();
         
         if (syncTimeout == 0) {
           syncTimeout = millis();
-          Serial.println(F("[INIT] 兩個致動器下降至初始位置..."));
+          Serial.println(F("[INIT] 初始化: 下降至底部..."));
         }
         
         if (millis() - syncTimeout > SYNC_TIMEOUT_MS) {
-          Serial.println(F("[INIT] 警告: 同步超時!"));
+          Serial.println(F("[INIT] 錯誤: 超時保護觸發!"));
+          stopAllPWM();
+          currentState = STATE_EMERGENCY_STOP;
         }
       } else {
         stopAllPWM();
         syncTimeout = 0;
         currentState = STATE_STANDBY;
-        Serial.println(F("[INIT] 初始化完成,進入待機"));
-        beepStart(NOTE_E5, 100);
+        Serial.println(F("[INIT] 初始化完成 → 待機"));
+        playSound(SOUND_INIT_COMPLETE);
       }
       break;
     
@@ -609,7 +724,8 @@ void handleStateMachine() {
       if (!wheelDown && currentSpeed >= SPEED_UP_THRESHOLD && currentSpeed >= SPEED_MIN_SAFE) {
         currentState = STATE_RISING;
         syncTimeout = millis();
-        Serial.println(F("[STANDBY] 開始上升"));
+        Serial.println(F("[STANDBY] 待機 → 上升"));
+        playSound(SOUND_RISING);
         break;
       }
       
@@ -630,7 +746,8 @@ void handleStateMachine() {
         stopAllPWM();
         currentState = STATE_FALLING;
         syncTimeout = millis();
-        Serial.println(F("[RISING] 開始下降"));
+        Serial.println(F("[RISING] 上升 → 下降"));
+        playSound(SOUND_FALLING);
         irCommandReceived = false;
         break;
       }
@@ -639,13 +756,15 @@ void handleStateMachine() {
         stopAllPWM();
         syncTimeout = 0;
         currentState = STATE_UP;
-        Serial.println(F("[RISING] 已到達頂部"));
-        beepStart(NOTE_G5, 100);
+        Serial.println(F("[RISING] 到達頂部"));
+        playSound(SOUND_LIMIT_REACHED);
       } else {
-        moveUp();  // 使用統一控制函式,內部會再次檢查限位
+        moveUp();
         
         if (millis() - syncTimeout > SYNC_TIMEOUT_MS) {
-          Serial.println(F("[RISING] 警告: 同步超時!"));
+          Serial.println(F("[RISING] 錯誤: 超時保護!"));
+          stopAllPWM();
+          currentState = STATE_EMERGENCY_STOP;
         }
       }
       break;
@@ -661,7 +780,8 @@ void handleStateMachine() {
       if (currentSpeed < SPEED_MIN_SAFE || wheelDown || irCommandReceived) {
         currentState = STATE_FALLING;
         syncTimeout = millis();
-        Serial.println(F("[UP] 開始下降"));
+        Serial.println(F("[UP] 頂部 → 下降"));
+        playSound(SOUND_FALLING);
         irCommandReceived = false;
         break;
       }
@@ -678,16 +798,18 @@ void handleStateMachine() {
         stopAllPWM();
         syncTimeout = 0;
         currentState = STATE_STANDBY;
-        Serial.println(F("[FALLING] 已到達底部"));
-        beepStart(NOTE_C5, 100);
+        Serial.println(F("[FALLING] 到達底部"));
+        playSound(SOUND_LIMIT_REACHED);
       } else {
-        moveDown();  // 使用統一控制函式,內部會再次檢查限位
+        moveDown();
         
         if (syncTimeout == 0) {
           syncTimeout = millis();
         }
         if (millis() - syncTimeout > SYNC_TIMEOUT_MS) {
-          Serial.println(F("[FALLING] 警告: 同步超時!"));
+          Serial.println(F("[FALLING] 錯誤: 超時保護!"));
+          stopAllPWM();
+          currentState = STATE_EMERGENCY_STOP;
         }
       }
       break;
@@ -702,9 +824,7 @@ void handleStateMachine() {
             Serial.println(F("[EMERGENCY] 手動重置"));
             currentState = STATE_INIT;
             syncTimeout = 0;
-            beepStart(NOTE_C5, 100);
-            delay(100);
-            beepStart(NOTE_E5, 100);
+            playSound(SOUND_BUTTON);
           }
         }
       }
@@ -729,7 +849,7 @@ void handleStateMachine() {
           manualResetConfirmed = true;
           currentState = STATE_INIT;
           Serial.println(F("[COOLING] 手動重置確認"));
-          beepStart(NOTE_C6, 200);
+          playSound(SOUND_INIT_COMPLETE);
         }
       }
       break;
@@ -745,7 +865,7 @@ void handleIRCommand(uint32_t code) {
 
   if(currentPriority < PRIORITY_MANUAL) {
     Serial.println(F("IR: 被更高優先權阻擋"));
-    beepStart(NOTE_C5, 100);
+    playSound(SOUND_BUTTON);
     return;
   }
 
@@ -754,44 +874,99 @@ void handleIRCommand(uint32_t code) {
   ctrlSrc = 2;
   irCommandReceived = true;
 
-  beepStart(NOTE_A5, 50);
+  playSound(SOUND_BUTTON);
   Serial.print(F("IR: 目標 "));
   Serial.println(wheelDown ? F("下降") : F("上升"));
 }
 
 // ============================================================================
-// OLED 顯示
+// 優化的 OLED 顯示介面
 // ============================================================================
 void showStartupPro() {
   display.clearDisplay();
+  
+  // 標題動畫
   display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(10,10);
-  display.print(F("DUAL-ACT"));
-  display.setCursor(20,40);
-  display.print(F("v6.1"));
+  display.setCursor(10, 5);
+  display.print(F("Bike!!"));
+  
+  // 版本號
+  display.setTextSize(1);
+  display.setCursor(35, 25);
+  display.print(F("System"));
+  
+  display.setTextSize(2);
+  display.setCursor(30, 40);
+  display.print(F("v7.0"));
+  
   display.display();
-  delay(1000);
+  delay(1500);
+  
+  // 載入動畫
+  for(int i = 0; i < 3; i++) {
+    display.fillRect(20 + i*30, 58, 20, 4, SSD1306_WHITE);
+    display.display();
+    delay(200);
+  }
+}
+
+void drawProgressBar(int x, int y, int w, int h, float value, float max_val) {
+  // 外框
+  display.drawRect(x, y, w, h, SSD1306_WHITE);
+  
+  // 內部填充
+  int fillWidth = (int)((value / max_val) * (w - 2));
+  if(fillWidth > 0) {
+    display.fillRect(x + 1, y + 1, fillWidth, h - 2, SSD1306_WHITE);
+  }
+}
+
+void drawStatusIcon(int x, int y, SystemState state) {
+  switch(state) {
+    case STATE_RISING:
+      // 上升箭頭
+      display.drawLine(x+3, y+7, x+3, y, SSD1306_WHITE);
+      display.drawLine(x+3, y, x+1, y+2, SSD1306_WHITE);
+      display.drawLine(x+3, y, x+5, y+2, SSD1306_WHITE);
+      break;
+      
+    case STATE_FALLING:
+      // 下降箭頭
+      display.drawLine(x+3, y, x+3, y+7, SSD1306_WHITE);
+      display.drawLine(x+3, y+7, x+1, y+5, SSD1306_WHITE);
+      display.drawLine(x+3, y+7, x+5, y+5, SSD1306_WHITE);
+      break;
+      
+    case STATE_STANDBY:
+    case STATE_UP:
+      // 暫停符號
+      display.fillRect(x+1, y, 2, 8, SSD1306_WHITE);
+      display.fillRect(x+4, y, 2, 8, SSD1306_WHITE);
+      break;
+      
+    case STATE_EMERGENCY_STOP:
+      // 警告三角形
+      display.drawTriangle(x+3, y, x, y+7, x+6, y+7, SSD1306_WHITE);
+      display.drawPixel(x+3, y+3, SSD1306_WHITE);
+      display.drawPixel(x+3, y+4, SSD1306_WHITE);
+      display.drawPixel(x+3, y+6, SSD1306_WHITE);
+      break;
+      
+    default:
+      display.fillCircle(x+3, y+4, 3, SSD1306_WHITE);
+      break;
+  }
 }
 
 void drawDashboard() {
   display.clearDisplay();
-
-  display.setTextSize(3);
+  
+  // ========== 頂部狀態列 ==========
+  display.setTextSize(1);
   display.setCursor(0, 0);
-  display.print((int)currentSpeed);
-  display.setTextSize(1);
-  display.setCursor(45, 0);
-  display.print(F("km/h"));
-
-  display.setTextSize(2);
-  display.setCursor(0, 24);
-  display.print(compAngleX, 1);
-  display.print(F("'"));
-
-  display.setTextSize(1);
-  display.setCursor(65, 0);
-  display.print(F("P:"));
+  
+  // 優先權標示
   switch(currentPriority) {
     case PRIORITY_EMERGENCY: display.print(F("EMG")); break;
     case PRIORITY_SAFETY_DOWN: display.print(F("SAF")); break;
@@ -799,44 +974,104 @@ void drawDashboard() {
     case PRIORITY_MANUAL: display.print(F("MAN")); break;
     case PRIORITY_AUTO: display.print(F("AUT")); break;
   }
-
-  display.setCursor(65, 10);
-  display.print(F("S:"));
-  switch(currentState) {
-    case STATE_INIT: display.print(F("INIT")); break;
-    case STATE_STANDBY: display.print(F("STBY")); break;
-    case STATE_RISING: display.print(F("^UP^")); break;
-    case STATE_UP: display.print(F("TOP")); break;
-    case STATE_FALLING: display.print(F("vDNv")); break;
-    case STATE_EMERGENCY_STOP: display.print(F("EMRG")); break;
-    case STATE_OVERCURRENT: display.print(F("OCUR")); break;
-    case STATE_COOLING: display.print(F("COOL")); break;
-  }
-
-  display.setCursor(65, 20);
-  display.print(F("I:"));
-  display.print(current_A, 1);
-  display.print(F("A"));
-
-  display.setCursor(65, 30);
-  display.print(F("PWM:"));
+  
+  // 分隔線
+  display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
+  
+  // ========== 主要資訊區 ==========
+  
+  // 速度顯示 (大字)
+  display.setTextSize(3);
+  display.setCursor(0, 12);
+  int speedInt = (int)currentSpeed;
+  if(speedInt < 10) display.print(F(" "));
+  display.print(speedInt);
+  
+  display.setTextSize(1);
+  display.setCursor(50, 15);
+  display.print(F("km/h"));
+  
+  // 速度進度條
+  drawProgressBar(0, 33, 60, 5, currentSpeed, 30.0);
+  
+  // ========== 右側資訊欄 ==========
+  
+  // 角度
+  display.setTextSize(1);
+  display.setCursor(65, 12);
+  display.print(F("Ang:"));
+  display.setCursor(65, 21);
+  display.setTextSize(1);
+  display.print(compAngleX, 1);
+  display.print((char)247); // 度數符號
+  
+  // PWM 值
+  display.setTextSize(1);
+  display.setCursor(95, 12);
+  display.print(F("PWM"));
+  display.setCursor(95, 21);
   display.print(pwmSpeedUp);
-
-  display.setCursor(0, 56);
-  display.print(actuator1.upLimitPressed ? F("LU") : F("--"));
-  display.print(F(" "));
-  display.print(actuator1.downLimitPressed ? F("LD") : F("--"));
-  display.print(F(" "));
-  display.print(actuator2.upLimitPressed ? F("RU") : F("--"));
-  display.print(F(" "));
-  display.print(actuator2.downLimitPressed ? F("RD") : F("--"));
-
-  display.setCursor(65, 45);
-  if(tiltWarning) display.print(F("TILT!"));
-  else if(manualMode) display.print(F("MAN"));
-  else if(!i2cHealthy) display.print(F("I2C!"));
-  else display.print(F("OK"));
-
+  
+ /* // 電流 (如果啟用)
+  if(!IGNORE_CURRENT_SENSOR) {
+    display.setCursor(65, 30);
+    display.print(current_A, 1);
+    display.print(F("A"));
+  } */
+  
+  // ========== 狀態圖示區 ==========
+  display.drawLine(0, 40, 127, 40, SSD1306_WHITE);
+  
+  // 狀態圖示
+  drawStatusIcon(5, 43, currentState);
+  
+  // 狀態文字
+  display.setTextSize(1);
+  display.setCursor(15, 44);
+  switch(currentState) {
+    case STATE_INIT: display.print(F("INIT...")); break;
+    case STATE_STANDBY: display.print(F("READY")); break;
+    case STATE_RISING: display.print(F("RISING")); break;
+    case STATE_UP: display.print(F("TOP")); break;
+    case STATE_FALLING: display.print(F("FALLING")); break;
+    case STATE_EMERGENCY_STOP: display.print(F("EMERGENCY")); break;
+    //case STATE_OVERCURRENT: display.print(F("OVERCUR")); break;
+    case STATE_COOLING: display.print(F("COOLING")); break;
+  }
+  
+  // ========== 底部限位開關狀態 ==========
+  display.setTextSize(1);
+  display.setCursor(0, 55);
+  
+  // 左側致動器
+  if(actuator1.isActive) {
+    display.print(actuator1.upLimitPressed ? F("[U]") : F(" - "));
+    display.print(F("/"));
+    display.print(actuator1.downLimitPressed ? F("[D]") : F(" - "));
+  } else {
+    display.print(F("OFF"));
+  }
+  
+  // 右側致動器 (如果啟用)
+  if(!SINGLE_ACTUATOR_TEST && actuator2.isActive) {
+    display.print(F(" "));
+    display.print(actuator2.upLimitPressed ? F("[U]") : F(" - "));
+    display.print(F("/"));
+    display.print(actuator2.downLimitPressed ? F("[D]") : F(" - "));
+  }
+  
+  // 警告圖示
+  display.setCursor(95, 55);
+  if(tiltWarning) {
+    display.print(F("TILT!"));
+  } else if(!i2cHealthy) {
+    display.print(F("I2C!"));
+  } else if(emergencyStopPressed) {
+    display.print(F("STOP"));
+  } else {
+    display.print(F("OK"));
+  }
+  
   display.display();
 }
 
@@ -872,12 +1107,7 @@ void setup() {
   analogWrite(PWM_PIN, 0);
   setRGBColor(RGB_OFF);
 
-  // 【關鍵改進】所有四個限位開關都設置中斷
-  attachInterrupt(digitalPinToInterrupt(LIMIT_LEFT_UP_PIN), emergencyStopPWM_ISR, FALLING);
-  attachInterrupt(digitalPinToInterrupt(LIMIT_LEFT_DOWN_PIN), emergencyStopPWM_ISR, FALLING);
-  // 注意: Pin 13 和 A1 不是中斷腳位,需透過主迴圈檢查
-  // 如果需要完整中斷保護,建議改用可中斷腳位 (2, 3, 18, 19, 20, 21)
-  
+  // 只設置速度感測器中斷
   attachInterrupt(digitalPinToInterrupt(HALL_SPEED_PIN), speedInterrupt, FALLING);
   IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
 
@@ -891,13 +1121,19 @@ void setup() {
   calibrateIMU();
 
   showStartupPro();
-  beepStart(NOTE_C6, 100);
+  playSound(SOUND_INIT_COMPLETE);
 
-  Serial.println(F("============================"));
-  Serial.println(F("  雙致動器系統 v6.1"));
-  Serial.println(F("  限位保護修正版"));
-  Serial.println(F("============================"));
+  Serial.println(F("===================================="));
+  Serial.println(F("  雙致動器智能控制系統 v7.0"));
+  Serial.println(F("  完整修正版 - 單致動器測試模式"));
+  Serial.println(F("===================================="));
 
+  Serial.println(F("\n=== 系統配置 ==="));
+  Serial.print(F("測試模式: "));
+  Serial.println(SINGLE_ACTUATOR_TEST ? F("單致動器") : F("雙致動器"));
+  Serial.print(F("電流檢測: "));
+  Serial.println(IGNORE_CURRENT_SENSOR ? F("停用") : F("啟用"));
+  
   Serial.println(F("\n=== 系統診斷 ==="));
   Serial.print(F("緊急按鈕: "));
   Serial.println(digitalRead(EMERGENCY_STOP_PIN) ? F("HIGH") : F("LOW"));
@@ -906,14 +1142,17 @@ void setup() {
   
   Serial.println(F("\n=== 限位開關初始狀態 ==="));
   updateLimitSwitches();
-  Serial.print(F("左上: ")); 
-  Serial.println(actuator1.upLimitPressed ? F("觸發") : F("未觸發"));
-  Serial.print(F("左下: ")); 
-  Serial.println(actuator1.downLimitPressed ? F("觸發") : F("未觸發"));
-  Serial.print(F("右上: ")); 
-  Serial.println(actuator2.upLimitPressed ? F("觸發") : F("未觸發"));
-  Serial.print(F("右下: ")); 
-  Serial.println(actuator2.downLimitPressed ? F("觸發") : F("未觸發"));
+  Serial.print(F("左上 (52): ")); 
+  Serial.println(digitalRead(LIMIT_LEFT_UP_PIN) == LOW ? F("觸發") : F("未觸發"));
+  Serial.print(F("左下 (53): ")); 
+  Serial.println(digitalRead(LIMIT_LEFT_DOWN_PIN) == LOW ? F("觸發") : F("未觸發"));
+  
+  if(!SINGLE_ACTUATOR_TEST) {
+    Serial.print(F("右上 (13): ")); 
+    Serial.println(digitalRead(LIMIT_RIGHT_UP_PIN) == LOW ? F("觸發") : F("未觸發"));
+    Serial.print(F("右下 (A1): ")); 
+    Serial.println(digitalRead(LIMIT_RIGHT_DOWN_PIN) == LOW ? F("觸發") : F("未觸發"));
+  }
 
   Serial.println(F("\n=== IMU 狀態 ==="));
   readIMU();
@@ -928,12 +1167,14 @@ void setup() {
     compAngleX = 0;
   }
 
-  Serial.println(F("\n【v6.1 改進項目】"));
-  Serial.println(F("✓ 最高優先權硬體限位保護"));
-  Serial.println(F("✓ 統一 PWM 控制入口"));
-  Serial.println(F("✓ 完整雙致動器中斷 (左側)"));
-  Serial.println(F("✓ 任一到位即停止邏輯"));
-  Serial.println(F("================\n"));
+  Serial.println(F("\n【v7.0 改進項目】"));
+  Serial.println(F("✓ 修正限位開關檢測 (移除不支援中斷)"));
+  Serial.println(F("✓ 完整音效系統 (5種獨立音效)"));
+  Serial.println(F("✓ 單致動器測試模式"));
+  Serial.println(F("✓ 優化 OLED 介面顯示"));
+  Serial.println(F("✓ 修正速度閾值 15 km/h"));
+  Serial.println(F("✓ 10秒超時保護"));
+  Serial.println(F("=====================================\n"));
 
   lastI2CSuccess = millis();
   lastLoopTime = millis();
@@ -963,7 +1204,7 @@ void loop() {
     safeStartTime = 0;
     syncTimeout = 0;
     
-    beepStart(NOTE_A5, 300);
+    playSound(SOUND_EMERGENCY);
   }
   lastLoopTime = currentMillis;
 
@@ -980,7 +1221,7 @@ void loop() {
     i2cHealthy = true;
     lastI2CSuccess = millis();
     
-    beepStart(NOTE_C5, 200);
+    playSound(SOUND_BUTTON);
   }
 
   beepUpdate();
@@ -989,8 +1230,6 @@ void loop() {
   readMotorCurrent();
   readSpeedControl();
   updateLimitSwitches();
-
-  // 【關鍵】每次迴圈都檢查硬體限位
   checkHardwareLimits();
 
   if(newSpeedData) {
@@ -1021,7 +1260,7 @@ void loop() {
       currentState = STATE_OVERCURRENT;
       stopAllPWM();
       Serial.println(F("【警告】電流過載!"));
-      beepStart(NOTE_C6, 300);
+      playSound(SOUND_EMERGENCY);
     }
   } else {
     overCurrentDetected = false;
@@ -1043,7 +1282,7 @@ void loop() {
     if(!tiltWarning && (millis() - tiltStartTime >= TILT_TRIGGER_TIME)) {
       tiltWarning = true;
       Serial.println(F(">>> 傾斜警告"));
-      beepStart(NOTE_C6, 200);
+      playSound(SOUND_TILT_WARNING);
     }
   } else {
     tiltStartTime = 0;
@@ -1077,7 +1316,7 @@ void loop() {
   if(millis() - lastPrintTime > 1000) {
     lastPrintTime = millis();
 
-    Serial.print(F("優先權:"));
+    Serial.print(F("P:"));
     switch(currentPriority) {
       case PRIORITY_EMERGENCY: Serial.print(F("緊急")); break;
       case PRIORITY_SAFETY_DOWN: Serial.print(F("安全")); break;
@@ -1086,7 +1325,7 @@ void loop() {
       case PRIORITY_AUTO: Serial.print(F("自動")); break;
     }
 
-    Serial.print(F(" |狀態:"));
+    Serial.print(F(" |S:"));
     switch(currentState) {
       case STATE_INIT: Serial.print(F("初始")); break;
       case STATE_STANDBY: Serial.print(F("待機")); break;
@@ -1102,54 +1341,35 @@ void loop() {
     Serial.print(wheelDown ? F("下") : F("上"));
 
     Serial.print(F(" |限位:"));
-    Serial.print(anyAtTop ? F("任頂") : F("--"));
-    Serial.print(F("/"));
-    Serial.print(bothAtTop ? F("雙頂") : F("--"));
-    Serial.print(F("/"));
-    Serial.print(anyAtBottom ? F("任底") : F("--"));
-    Serial.print(F("/"));
-    Serial.print(bothAtBottom ? F("雙底") : F("--"));
+    if(SINGLE_ACTUATOR_TEST) {
+      Serial.print(actuator1.upLimitPressed ? F("U") : F("-"));
+      Serial.print(actuator1.downLimitPressed ? F("D") : F("-"));
+    } else {
+      Serial.print(anyAtTop ? F("T") : F("-"));
+      Serial.print(bothAtTop ? F("T2") : F("--"));
+      Serial.print(anyAtBottom ? F("B") : F("-"));
+      Serial.print(bothAtBottom ? F("B2") : F("--"));
+    }
 
     Serial.print(F(" |速度:"));
     Serial.print(currentSpeed, 1);
     Serial.print(F("km/h"));
 
-    Serial.print(F(" |角度:"));
+    Serial.print(F(" |角:"));
     Serial.print(compAngleX, 1);
-    Serial.print(F("°"));
-
-    Serial.print(F(" |電流:"));
-    Serial.print(current_A, 2);
-    Serial.print(F("A"));
+    Serial.print((char)176);
 
     Serial.print(F(" |PWM:"));
     Serial.print(pwmSpeedUp);
 
     Serial.print(F(" |馬達:"));
-    int currentPWM = 0;
-    if (!anyAtTop && !anyAtBottom) {
-      currentPWM = (currentState == STATE_RISING || currentState == STATE_FALLING) ? 1 : 0;
-    }
-    Serial.print(currentPWM ? F("ON") : F("OFF"));
-
-    Serial.print(F(" |速度計數:L"));
-    Serial.print(speedLowCount);
-    Serial.print(F("/H"));
-    Serial.print(speedHighCount);
+    int motorActive = (currentState == STATE_RISING || currentState == STATE_FALLING) ? 1 : 0;
+    Serial.print(motorActive ? F("ON") : F("OFF"));
 
     if(tiltWarning) Serial.print(F(" [傾斜!]"));
     if(manualMode) Serial.print(F(" [手動]"));
     if(emergencyStopPressed) Serial.print(F(" [急停]"));
     if(!i2cHealthy) Serial.print(F(" [I2C錯]"));
-
-    Serial.print(F(" 來源:"));
-    switch(ctrlSrc) {
-      case 0: Serial.print(F("--")); break;
-      case 1: Serial.print(F("限位")); break;
-      case 2: Serial.print(F("IR")); break;
-      case 3: Serial.print(F("自動")); break;
-      case 4: Serial.print(F("傾斜")); break;
-    }
 
     Serial.println();
   }
