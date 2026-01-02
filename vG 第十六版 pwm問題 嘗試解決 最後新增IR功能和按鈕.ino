@@ -838,23 +838,44 @@ void setup() {
     if (upperRaw) Serial.println(F("  -> 目前在上限位置"));
     if (lowerRaw) Serial.println(F("  -> 目前在下限位置"));
   } else {
-    Serial.println(F(">> 開始 PWM 測試 (200 PWM, 100ms)"));
+    Serial.println(F(">> 開始 PWM 測試 (200 PWM, 最長100ms)"));
     
     // 測試期間白光指示
     setRGB(255, 255, 255);
     
     // 啟動 PWM
     analogWrite(PWM_PIN, 200);
-    delay(100);
     
-    // 停止 PWM
+    // 安全延遲：每10ms檢查一次限位開關
+    unsigned long testStart = millis();
+    bool limitTriggered = false;
+    
+    while (millis() - testStart < 100) {
+      // 持續檢查限位開關
+      upperRaw = (digitalRead(LIMIT_UP_PIN) == LOW);
+      lowerRaw = (digitalRead(LIMIT_DOWN_PIN) == LOW);
+      
+      if (upperRaw || lowerRaw) {
+        Serial.println(F("  -> 偵測到限位觸發，立即停止測試"));
+        limitTriggered = true;
+        break;
+      }
+      
+      delay(10);  // 每10ms檢查一次
+    }
+    
+    // 立即停止 PWM
     analogWrite(PWM_PIN, 0);
     
     // 關閉 LED
     setRGB(0, 0, 0);
     
-    Serial.println(F("OK: PWM 測試完成"));
-    Serial.println(F("馬達啟動，模組正常工作"));
+    if (limitTriggered) {
+      Serial.println(F("警告: 測試期間觸發限位，請檢查機構"));
+    } else {
+      Serial.println(F("OK: PWM 測試完成"));
+      Serial.println(F("  如果馬達有短暫啟動，模組正常工作"));
+    }
     
     delay(500);
   }
