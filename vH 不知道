@@ -1,5 +1,5 @@
 // ============================================================================
-// 輔助輪v9.1 - 含改進的開機自檢
+// 輔助輪 v9.3 - 修正 PWM 初始化與 Homing 流程完整性
 // ============================================================================
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -28,977 +28,809 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 // ============================================================================
 // MPU6050 加速度計設定
 // ============================================================================
-#define MPU_ADDR 0x69          // MPU6050 I2C 地址（AD0接VCC時為0x69，接地時為0x68）
-#define PWR_MGMT_1 0x6B        // 電源管理暫存器
-#define ACCEL_XOUT_H 0x3B      // 加速度計資料起始位址
+#define MPU_ADDR 0x69
+#define PWR_MGMT_1 0x6B
+#define ACCEL_XOUT_H 0x3B
 
 // ============================================================================
 // 腳位定義
 // ============================================================================
-const byte BUZZER_PIN = 8;           // 蜂鳴器
-const byte IR_RECEIVE_PIN = 3;       // 紅外線接收器
-const byte PWM_PIN = 9;              // PWM 馬達控制輸出
-
-// 限位開關（常開型，LOW = 觸發）
-const byte LIMIT_UP_PIN = 52;        // 上限位開關
-const byte LIMIT_DOWN_PIN = 53;      // 下限位開關
-
-// 速度感測器
-const byte HALL_SPEED_PIN = 2;       // 霍爾速度感測器（中斷腳位）
-const byte SPEED_CONTROL_PIN = A0;   // PWM 速度調整旋鈕
-
-// RGB LED 三色燈
-const byte RGB_RED_PIN = 5;          // 紅色
-const byte RGB_GREEN_PIN = 7;        // 綠色
-const byte RGB_BLUE_PIN = 6;         // 藍色
-
-// 實體按鈕 - 頁面切換
-const byte BUTTON_PIN = 12;          // 按鈕腳位
+const byte BUZZER_PIN = 8;
+const byte IR_RECEIVE_PIN = 3;
+const byte PWM_PIN = 9;
+const byte LIMIT_UP_PIN = 52;
+const byte LIMIT_DOWN_PIN = 53;
+const byte HALL_SPEED_PIN = 2;
+const byte SPEED_CONTROL_PIN = A0;
+const byte RGB_RED_PIN = 5;
+const byte RGB_GREEN_PIN = 7;
+const byte RGB_BLUE_PIN = 6;
+const byte BUTTON_PIN = 12;
 
 // ============================================================================
 // 系統狀態定義
 // ============================================================================
 enum SystemState : byte {
-  AT_TOP,      // 在上限位置
-  AT_BOTTOM,   // 在下限位置
-  MOVING_UP,   // 向上移動中
-  MOVING_DOWN  // 向下移動中
+HOMING,
+AT_TOP,
+AT_BOTTOM,
+MOVING_UP,
+MOVING_DOWN
+};
+
+enum HomingPhase : byte {
+HOMING_NOT_STARTED,
+HOMING_MOVING,
+HOMING_COMPLETED,
+HOMING_FAILED
 };
 
 // ============================================================================
 // 全域變數
 // ============================================================================
-SystemState currentState = AT_BOTTOM;  // 當前系統狀態
+SystemState currentState = HOMING;
+HomingPhase homingPhase = HOMING_NOT_STARTED;
 
-// 測試模式標記（新增）
+// Homing 控制參數
+const unsigned long HOMING_TIMEOUT = 8000;
+const int HOMING_PWM_SPEED = 180;
+unsigned long homingStartTime = 0;
+bool homingEnabled = true;
+
+// 測試模式標記
 bool systemInTestMode = false;
 
-// 限位開關相關
-bool upperLimit = false;                    // 上限位開關狀態
-bool lowerLimit = false;                    // 下限位開關狀態
-unsigned long lastLimitCheck = 0;           // 上次檢查時間
-const unsigned long LIMIT_DEBOUNCE = 50;    // 去彈跳延遲（毫秒）
+// 限位開關
+bool upperLimit = false;
+bool lowerLimit = false;
+unsigned long lastLimitCheck = 0;
+const unsigned long LIMIT_DEBOUNCE = 50;
 
-// 系統鎖定機制
-bool systemLocked = false;                  // 系統是否鎖定
-unsigned long lockStartTime = 0;            // 鎖定開始時間
-const unsigned long LOCK_DURATION = 500;    // 鎖定持續時間（毫秒）
+// 系統鎖定
+bool systemLocked = false;
+unsigned long lockStartTime = 0;
+const unsigned long LOCK_DURATION = 500;
 
 // PWM 控制
-int pwmSpeed = 190;                         // PWM 速度值（100-255）
-unsigned long lastSpeedRead = 0;            // 上次讀取旋鈕時間
-
-// PWM 手動覆寫模式
-bool pwmManualOverride = false;             // 是否進入手動模式（安全模式）
+int pwmSpeed = 190;
+unsigned long lastSpeedRead = 0;
+bool pwmManualOverride = false;
 
 // 速度測量
-#define WHEEL_CIRCUMFERENCE 204.2           // 輪子周長（公分）
-volatile uint32_t lastSpeedTrigger = 0;     // 上次速度觸發時間（微秒）
-volatile uint32_t speedPulseInterval = 0;   // 速度脈衝間隔（微秒）
-volatile bool newSpeedData = false;         // 是否有新速度資料
-float currentSpeed = 0.0;                   // 當前速度（km/h）
-unsigned long lastSpeedUpdate = 0;          // 上次速度更新時間
-const unsigned long SPEED_TIMEOUT = 2000;   // 速度逾時（毫秒，超過此時間速度歸零）
+#define WHEEL_CIRCUMFERENCE 204.2
+volatile uint32_t lastSpeedTrigger = 0;
+volatile uint32_t speedPulseInterval = 0;
+volatile bool newSpeedData = false;
+float currentSpeed = 0.0;
+unsigned long lastSpeedUpdate = 0;
+const unsigned long SPEED_TIMEOUT = 2000;
 
-// 自動升降邏輯
-const float AUTO_LIFT_SPEED = 15.0;                // 自動升降觸發速度（km/h）
-const unsigned long SPEED_HOLD_TIME = 1000;        // 速度需持續時間（毫秒）
-unsigned long speedAboveThresholdTime = 0;         // 速度超過閾值的開始時間
-bool speedTimerRunning = false;                    // 計時器是否運行中
-bool autoLiftDone = false;                         // 本次週期是否已完成自動升降
+// 自動升降
+const float AUTO_LIFT_SPEED = 15.0;
+const unsigned long SPEED_HOLD_TIME = 1000;
+unsigned long speedAboveThresholdTime = 0;
+bool speedTimerRunning = false;
+bool autoLiftDone = false;
 
-// 紅外線遙控
-unsigned long lastIRTime = 0;               // 上次IR訊號時間
-const unsigned long IR_DELAY = 500;         // IR 訊號防彈跳延遲
+// 紅外線 (統一管理)
+unsigned long lastIRTime = 0;
+const unsigned long IR_DELAY = 500;
+bool irDataAvailable = false;
+uint32_t irCode = 0;
 
-// OLED 顯示 - 三頁模式
-byte currentPage = 0;                       // 當前頁面（0=主頁，1=除錯，2=系統資訊）
-unsigned long lastDisplayUpdate = 0;        // 上次更新顯示時間
+// OLED
+byte currentPage = 0;
+unsigned long lastDisplayUpdate = 0;
 
-// 按鈕控制
-bool lastButtonState = HIGH;                // 上次按鈕狀態
-unsigned long lastButtonPress = 0;          // 上次按下時間
-const unsigned long BUTTON_DEBOUNCE = 200;  // 按鈕去彈跳延遲
+// 按鈕
+bool lastButtonState = HIGH;
+unsigned long lastButtonPress = 0;
+const unsigned long BUTTON_DEBOUNCE = 200;
 
-// 序列埠輸出
-unsigned long lastSerialPrint = 0;          // 上次序列埠輸出時間
+// 序列埠
+unsigned long lastSerialPrint = 0;
 
-// IMU 慣性測量單元資料
-float tiltAngle = 0.0;                      // 傾斜角度
-unsigned long lastIMURead = 0;              // 上次讀取IMU時間
-const unsigned long IMU_READ_INTERVAL = 100;// IMU 讀取間隔
-const float TILT_WARNING = 10.0;            // 傾斜警告角度
-const float TILT_DANGER = 15.0;             // 傾斜危險角度
-bool lastTiltWarning = false;               // 上次是否有警告
+// IMU
+float tiltAngle = 0.0;
+unsigned long lastIMURead = 0;
+const unsigned long IMU_READ_INTERVAL = 100;
+const float TILT_WARNING = 10.0;
+const float TILT_DANGER = 15.0;
+bool lastTiltWarning = false;
 
 // ============================================================================
-// 速度中斷服務函數
+// 速度中斷
 // ============================================================================
 void speedInterrupt() {
-  uint32_t now = micros();
-  uint32_t interval = now - lastSpeedTrigger;
-  
-  // 防止雜訊（間隔需大於40ms）
-  if (interval > 40000) {
-    speedPulseInterval = interval;
-    lastSpeedTrigger = now;
-    newSpeedData = true;
-  }
+uint32_t now = micros();
+uint32_t interval = now - lastSpeedTrigger;
+if (interval > 40000) {
+speedPulseInterval = interval;
+lastSpeedTrigger = now;
+newSpeedData = true;
+}
 }
 
 // ============================================================================
-// RGB LED 控制函數
+// RGB LED
 // ============================================================================
 void setRGB(byte r, byte g, byte b) {
-  analogWrite(RGB_RED_PIN, r);
-  analogWrite(RGB_GREEN_PIN, g);
-  analogWrite(RGB_BLUE_PIN, b);
+analogWrite(RGB_RED_PIN, r);
+analogWrite(RGB_GREEN_PIN, g);
+analogWrite(RGB_BLUE_PIN, b);
 }
 
 void updateRGBByState() {
-  if (pwmManualOverride) {
-    // PWM 手動關閉 - 閃爍紅色警告
-    static unsigned long lastBlink = 0;
-    static bool blinkState = false;
-    if (millis() - lastBlink > 300) {
-      lastBlink = millis();
-      blinkState = !blinkState;
-      setRGB(blinkState ? 255 : 0, 0, 0);
-    }
-    return;
-  }
-  
-  // 根據狀態顯示不同顏色
-  switch(currentState) {
-    case AT_TOP:
-      setRGB(0, 255, 255);  // 青色
-      break;
-    case AT_BOTTOM:
-      setRGB(255, 200, 0);  // 黃色
-      break;
-    case MOVING_UP:
-      setRGB(0, 255, 0);    // 綠色
-      break;
-    case MOVING_DOWN:
-      setRGB(255, 0, 0);    // 紅色
-      break;
-  }
+if (pwmManualOverride) {
+static unsigned long lastBlink = 0;
+static bool blinkState = false;
+if (millis() - lastBlink > 300) {
+lastBlink = millis();
+blinkState = !blinkState;
+setRGB(blinkState ? 255 : 0, 0, 0);
+}
+return;
+}
+
+switch(currentState) {
+case HOMING:
+static unsigned long lastHomingBlink = 0;
+static bool homingBlinkState = false;
+if (millis() - lastHomingBlink > 500) {
+lastHomingBlink = millis();
+homingBlinkState = !homingBlinkState;
+setRGB(homingBlinkState ? 255 : 0, 0, homingBlinkState ? 255 : 0);
+}
+break;
+case AT_TOP:
+setRGB(0, 255, 255);
+break;
+case AT_BOTTOM:
+setRGB(255, 200, 0);
+break;
+case MOVING_UP:
+setRGB(0, 255, 0);
+break;
+case MOVING_DOWN:
+setRGB(255, 0, 0);
+break;
+}
 }
 
 // ============================================================================
-// 音效函數
+// 音效
 // ============================================================================
 void playStartupMusic() {
-  tone(BUZZER_PIN, NOTE_C4, 150); delay(180);
-  tone(BUZZER_PIN, NOTE_E4, 150); delay(180);
-  tone(BUZZER_PIN, NOTE_G4, 150); delay(180);
-  tone(BUZZER_PIN, NOTE_C5, 300); delay(350);
-  noTone(BUZZER_PIN);
+tone(BUZZER_PIN, NOTE_C4, 150); delay(180);
+tone(BUZZER_PIN, NOTE_E4, 150); delay(180);
+tone(BUZZER_PIN, NOTE_G4, 150); delay(180);
+tone(BUZZER_PIN, NOTE_C5, 300); delay(350);
+noTone(BUZZER_PIN);
 }
 
 void playBeep(uint16_t freq, uint16_t duration) {
-  tone(BUZZER_PIN, freq, duration);
-  delay(duration + 20);
-  noTone(BUZZER_PIN);
+tone(BUZZER_PIN, freq, duration);
+delay(duration + 20);
+noTone(BUZZER_PIN);
 }
 
 void playWarning() {
-  for(int i = 0; i < 3; i++) {
-    tone(BUZZER_PIN, NOTE_C6, 100);
-    delay(150);
-  }
-  noTone(BUZZER_PIN);
+for(int i = 0; i < 3; i++) {
+tone(BUZZER_PIN, NOTE_C6, 100);
+delay(150);
+}
+noTone(BUZZER_PIN);
+}
+
+void playHomingComplete() {
+tone(BUZZER_PIN, NOTE_G4, 150); delay(180);
+tone(BUZZER_PIN, NOTE_C5, 200); delay(220);
+noTone(BUZZER_PIN);
 }
 
 // ============================================================================
-// MPU 慣性測量單元函數
+// MPU6050
 // ============================================================================
 void setupIMU() {
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(PWR_MGMT_1);
-  Wire.write(0x00);  // 喚醒 MPU6050
-  byte error = Wire.endTransmission();
-  
-  if (error == 0) {
-    Serial.println(F("IMU 初始化成功"));
-  } else {
-    Serial.println(F("IMU 初始化失敗"));
-  }
-  delay(50);
+Wire.beginTransmission(MPU_ADDR);
+Wire.write(PWR_MGMT_1);
+Wire.write(0x00);
+byte error = Wire.endTransmission();
+if (error == 0) {
+Serial.println(F(“IMU 初始化成功”));
+} else {
+Serial.println(F(“IMU 初始化失敗”));
+}
+delay(50);
 }
 
 void readIMU() {
-  // 節流：每100ms讀取一次
-  if (millis() - lastIMURead < IMU_READ_INTERVAL) {
-    return;
-  }
-  lastIMURead = millis();
-  
-  // 開始讀取加速度計資料
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(ACCEL_XOUT_H);
-  byte error = Wire.endTransmission(false);
-  
-  if (error != 0) {
-    tiltAngle = 0.0;
-    return;
-  }
-  
-  // 讀取 X 和 Y 軸加速度
-  Wire.requestFrom((byte)MPU_ADDR, (byte)4);
-  if (Wire.available() >= 4) {
-    int16_t ax = (Wire.read() << 8) | Wire.read();
-    int16_t ay = (Wire.read() << 8) | Wire.read();
-    
-    // 讀取 Z 軸加速度
-    Wire.beginTransmission(MPU_ADDR);
-    Wire.write(ACCEL_XOUT_H + 4);
-    Wire.endTransmission(false);
-    Wire.requestFrom((byte)MPU_ADDR, (byte)2);
-    int16_t az = (Wire.read() << 8) | Wire.read();
-    
-    // 轉換為 g 值
-    float accelX = ax / 16384.0;
-    float accelZ = az / 16384.0;
-    
-    // 計算傾斜角度
-    tiltAngle = atan2(accelX, accelZ) * 57.2958;
-    
-    // 限制角度範圍
-    if (tiltAngle > 90) tiltAngle = 90;
-    if (tiltAngle < -90) tiltAngle = -90;
-  }
+if (millis() - lastIMURead < IMU_READ_INTERVAL) return;
+lastIMURead = millis();
+
+Wire.beginTransmission(MPU_ADDR);
+Wire.write(ACCEL_XOUT_H);
+byte error = Wire.endTransmission(false);
+if (error != 0) {
+tiltAngle = 0.0;
+return;
+}
+
+Wire.requestFrom((byte)MPU_ADDR, (byte)4);
+if (Wire.available() >= 4) {
+int16_t ax = (Wire.read() << 8) | Wire.read();
+int16_t ay = (Wire.read() << 8) | Wire.read();
+
+```
+Wire.beginTransmission(MPU_ADDR);
+Wire.write(ACCEL_XOUT_H + 4);
+Wire.endTransmission(false);
+Wire.requestFrom((byte)MPU_ADDR, (byte)2);
+int16_t az = (Wire.read() << 8) | Wire.read();
+
+float accelX = ax / 16384.0;
+float accelZ = az / 16384.0;
+tiltAngle = atan2(accelX, accelZ) * 57.2958;
+if (tiltAngle > 90) tiltAngle = 90;
+if (tiltAngle < -90) tiltAngle = -90;
+```
+
+}
 }
 
 void checkTiltWarning() {
-  float absTilt = abs(tiltAngle);
-  bool currentWarning = (absTilt >= TILT_WARNING);
-  
-  // 只在第一次觸發警告時發出聲音
-  if (currentWarning && !lastTiltWarning) {
-    if (absTilt >= TILT_DANGER) {
-      playWarning();  // 危險角度：三聲警報
-      Serial.print(F("[警告] 危險傾斜: "));
-      Serial.println(tiltAngle, 1);
-    } else {
-      tone(BUZZER_PIN, NOTE_A5, 200);  // 警告角度：單音
-      delay(220);
-      noTone(BUZZER_PIN);
-      Serial.print(F("[警告] 傾斜警告: "));
-      Serial.println(tiltAngle, 1);
-    }
-  }
-  
-  lastTiltWarning = currentWarning;
+float absTilt = abs(tiltAngle);
+bool currentWarning = (absTilt >= TILT_WARNING);
+
+if (currentWarning && !lastTiltWarning) {
+if (absTilt >= TILT_DANGER) {
+playWarning();
+Serial.print(F(”[警告] 危險傾斜: “));
+Serial.println(tiltAngle, 1);
+} else {
+tone(BUZZER_PIN, NOTE_A5, 200);
+delay(220);
+noTone(BUZZER_PIN);
+Serial.print(F(”[警告] 傾斜警告: “));
+Serial.println(tiltAngle, 1);
+}
+}
+lastTiltWarning = currentWarning;
 }
 
 // ============================================================================
-// 速度計算函數
+// 速度計算
 // ============================================================================
 void updateSpeed() {
-  // 如果有新的速度資料
-  if (newSpeedData) {
-    if (speedPulseInterval > 0) {
-      // 計算速度：周長 / 時間 * 0.036 轉換為 km/h
-      float timeInSec = speedPulseInterval / 1000000.0;
-      currentSpeed = (WHEEL_CIRCUMFERENCE / timeInSec) * 0.036;
-    }
-    newSpeedData = false;
-    lastSpeedUpdate = millis();
-  }
-  
-  // 如果太久沒有新資料，速度歸零
-  if (millis() - lastSpeedUpdate > SPEED_TIMEOUT) {
-    currentSpeed = 0.0;
-  }
+if (newSpeedData) {
+if (speedPulseInterval > 0) {
+float timeInSec = speedPulseInterval / 1000000.0;
+currentSpeed = (WHEEL_CIRCUMFERENCE / timeInSec) * 0.036;
+}
+newSpeedData = false;
+lastSpeedUpdate = millis();
+}
+
+if (millis() - lastSpeedUpdate > SPEED_TIMEOUT) {
+currentSpeed = 0.0;
+}
 }
 
 // ============================================================================
-// 限位開關檢查函數（修改版 - 加入測試模式保護）
+// 限位開關檢查 (修改版 - 在 Homing 期間更寬容)
 // ============================================================================
 void checkLimitSwitches() {
-  // *** 測試模式下跳過 ***
-  if (systemInTestMode) {
-    return;
-  }
-  
-  // 去彈跳處理
-  if (millis() - lastLimitCheck < LIMIT_DEBOUNCE) {
-    return;
-  }
-  lastLimitCheck = millis();
-  
-  // 讀取限位開關狀態（常開型，LOW = 觸發）
-  bool upperRaw = (digitalRead(LIMIT_UP_PIN) == LOW);
-  bool lowerRaw = (digitalRead(LIMIT_DOWN_PIN) == LOW);
-  
-  // 上限位開關觸發
-  if (upperRaw && !lowerRaw) {
-    analogWrite(PWM_PIN, 0);  // 立即停止馬達
-    currentState = AT_TOP;
-    systemLocked = true;
-    lockStartTime = millis();
-    upperLimit = true;
-    lowerLimit = false;
-    
-    // 重置自動升降狀態
-    autoLiftDone = false;
-    speedTimerRunning = false;
-    
+if (systemInTestMode) return;
+if (millis() - lastLimitCheck < LIMIT_DEBOUNCE) return;
+lastLimitCheck = millis();
+
+bool upperRaw = (digitalRead(LIMIT_UP_PIN) == LOW);
+bool lowerRaw = (digitalRead(LIMIT_DOWN_PIN) == LOW);
+
+// 異常狀態優先處理
+if (upperRaw && lowerRaw) {
+analogWrite(PWM_PIN, 0);
+currentState = AT_TOP;
+systemLocked = true;
+lockStartTime = millis();
+
+```
+if (homingPhase == HOMING_MOVING) {
+  homingPhase = HOMING_FAILED;
+}
+
+Serial.println(F("[錯誤] 兩個限位同時觸發！"));
+playWarning();
+return;
+```
+
+}
+
+// 上限位觸發
+if (upperRaw && !lowerRaw) {
+analogWrite(PWM_PIN, 0);
+
+```
+if (currentState == HOMING && homingPhase == HOMING_MOVING) {
+  // Homing 到上限 - 這不是預期結果,但仍標記完成
+  homingPhase = HOMING_COMPLETED;
+  currentState = AT_TOP;
+  playHomingComplete();
+  Serial.println(F("[Homing] 完成 - 到達上限 (非預期)"));
+} else {
+  currentState = AT_TOP;
+  if (homingPhase == HOMING_COMPLETED) {
     Serial.println(F("[限位] 到達上限"));
-    
-  // 下限位開關觸發
-  } else if (lowerRaw && !upperRaw) {
-    analogWrite(PWM_PIN, 0);  // 立即停止馬達
-    currentState = AT_BOTTOM;
-    systemLocked = true;
-    lockStartTime = millis();
-    upperLimit = false;
-    lowerLimit = true;
-    
-    Serial.println(F("[限位] 到達下限"));
-    
-  // 異常：兩個限位同時觸發
-  } else if (upperRaw && lowerRaw) {
-    analogWrite(PWM_PIN, 0);
-    currentState = AT_TOP;
-    systemLocked = true;
-    lockStartTime = millis();
-    
-    Serial.println(F("[錯誤] 兩個限位同時觸發！"));
-    playWarning();
-    
-  // 正常：都沒觸發
-  } else {
-    upperLimit = false;
-    lowerLimit = false;
   }
 }
 
+systemLocked = true;
+lockStartTime = millis();
+upperLimit = true;
+lowerLimit = false;
+autoLiftDone = false;
+speedTimerRunning = false;
+```
+
+// 下限位觸發
+} else if (lowerRaw && !upperRaw) {
+analogWrite(PWM_PIN, 0);
+
+```
+if (currentState == HOMING && homingPhase == HOMING_MOVING) {
+  homingPhase = HOMING_COMPLETED;
+  currentState = AT_BOTTOM;
+  playHomingComplete();
+  Serial.println(F("[Homing] 完成 - 到達下限"));
+} else {
+  currentState = AT_BOTTOM;
+  if (homingPhase == HOMING_COMPLETED) {
+    Serial.println(F("[限位] 到達下限"));
+  }
+}
+
+systemLocked = true;
+lockStartTime = millis();
+upperLimit = false;
+lowerLimit = true;
+```
+
+// 都沒觸發
+} else {
+upperLimit = false;
+lowerLimit = false;
+}
+}
+
 // ============================================================================
-// 馬達控制函數
+// Homing 歸位流程 (修改版 - 完整錯誤處理)
+// ============================================================================
+void performHoming() {
+// 已完成或失敗,退出
+if (homingPhase == HOMING_COMPLETED || homingPhase == HOMING_FAILED) {
+return;
+}
+
+// 使用者跳過
+if (!homingEnabled) {
+homingPhase = HOMING_COMPLETED;
+currentState = AT_BOTTOM;
+Serial.println(F(”[Homing] 已跳過 (使用者選擇)”));
+return;
+}
+
+// 首次執行:啟動歸位
+if (homingPhase == HOMING_NOT_STARTED) {
+Serial.println(F(”\n[Homing] 開始歸位流程”));
+Serial.println(F(”  策略: 向下移動至下限位”));
+Serial.print(F(”  PWM: “));
+Serial.println(HOMING_PWM_SPEED);
+Serial.print(F(”  逾時: “));
+Serial.print(HOMING_TIMEOUT / 1000);
+Serial.println(F(“秒”));
+
+```
+// 檢查當前限位狀態
+bool upperNow = (digitalRead(LIMIT_UP_PIN) == LOW);
+bool lowerNow = (digitalRead(LIMIT_DOWN_PIN) == LOW);
+
+if (lowerNow && !upperNow) {
+  // 已在下限,直接完成
+  homingPhase = HOMING_COMPLETED;
+  currentState = AT_BOTTOM;
+  playHomingComplete();
+  Serial.println(F("[Homing] 已在下限,直接完成"));
+  return;
+  
+} else if (upperNow && !lowerNow) {
+  Serial.println(F("[Homing] 從上限開始,向下移動"));
+  
+} else if (upperNow && lowerNow) {
+  // 限位開關異常
+  homingPhase = HOMING_FAILED;
+  currentState = AT_BOTTOM;  // 容錯:假設在下限
+  Serial.println(F("[Homing] 失敗 - 限位開關異常"));
+  playWarning();
+  return;
+  
+} else {
+  Serial.println(F("[Homing] 從中間位置開始,向下移動"));
+}
+
+// 啟動馬達向下
+analogWrite(PWM_PIN, HOMING_PWM_SPEED);
+homingPhase = HOMING_MOVING;
+homingStartTime = millis();
+Serial.println(F("[Homing] 馬達已啟動"));
+```
+
+}
+
+// 歸位進行中:監控進度與逾時
+if (homingPhase == HOMING_MOVING) {
+unsigned long elapsed = millis() - homingStartTime;
+
+```
+// 每秒輸出進度
+static unsigned long lastProgressPrint = 0;
+if (millis() - lastProgressPrint > 1000) {
+  lastProgressPrint = millis();
+  Serial.print(F("[Homing] 進行中... "));
+  Serial.print(elapsed / 1000);
+  Serial.print(F("s / "));
+  Serial.print(HOMING_TIMEOUT / 1000);
+  Serial.println(F("s"));
+}
+
+// 檢查逾時
+if (elapsed > HOMING_TIMEOUT) {
+  analogWrite(PWM_PIN, 0);
+  homingPhase = HOMING_FAILED;
+  currentState = AT_BOTTOM;  // 容錯:假設在下限
+  Serial.println(F("[Homing] 失敗 - 逾時未觸發限位"));
+  Serial.println(F("  可能原因: 機構卡住/限位開關故障"));
+  playWarning();
+}
+```
+
+}
+}
+
+// ============================================================================
+// 馬達控制
 // ============================================================================
 void startMotorUp() {
-  // 檢查是否在手動模式
-  if (pwmManualOverride) {
-    Serial.println(F("[控制] PWM 手動關閉"));
-    return;
-  }
-  
-  // 檢查系統鎖定
-  if (systemLocked) {
-    Serial.println(F("[控制] 系統已鎖定"));
-    return;
-  }
-  
-  // 防止重複啟動
-  if (currentState == MOVING_UP) {
-    Serial.println(F("[控制] 已在上升中"));
-    return;
-  }
-  
-  // 檢查是否已在上限
-  if (currentState == AT_TOP) {
-    Serial.println(F("[控制] 已在上限位置"));
-    return;
-  }
-  
-  // 啟動馬達上升
-  analogWrite(PWM_PIN, pwmSpeed);
-  currentState = MOVING_UP;
-  systemLocked = true;
-  lockStartTime = millis();
-  
-  playBeep(NOTE_A5, 100);
-  Serial.println(F("[馬達] 開始上升"));
+if (currentState == HOMING || homingPhase != HOMING_COMPLETED) {
+Serial.println(F(”[控制] Homing 未完成,拒絕”));
+return;
+}
+
+if (pwmManualOverride) {
+Serial.println(F(”[控制] PWM 手動關閉,拒絕”));
+return;
+}
+
+if (systemLocked) {
+Serial.println(F(”[控制] 系統鎖定,拒絕”));
+return;
+}
+
+if (currentState == MOVING_UP) {
+Serial.println(F(”[控制] 已在上升中”));
+return;
+}
+
+if (currentState == AT_TOP) {
+Serial.println(F(”[控制] 已在上限”));
+return;
+}
+
+analogWrite(PWM_PIN, pwmSpeed);
+currentState = MOVING_UP;
+systemLocked = true;
+lockStartTime = millis();
+playBeep(NOTE_A5, 100);
+Serial.print(F(”[馬達] 上升 PWM=”));
+Serial.println(pwmSpeed);
 }
 
 void startMotorDown() {
-  // 檢查是否在手動模式
-  if (pwmManualOverride) {
-    Serial.println(F("[控制] PWM 手動關閉"));
-    return;
-  }
-  
-  // 檢查系統鎖定
-  if (systemLocked) {
-    Serial.println(F("[控制] 系統已鎖定"));
-    return;
-  }
-  
-  // 防止重複啟動
-  if (currentState == MOVING_DOWN) {
-    Serial.println(F("[控制] 已在下降中"));
-    return;
-  }
-  
-  // 檢查是否已在下限
-  if (currentState == AT_BOTTOM) {
-    Serial.println(F("[控制] 已在下限位置"));
-    return;
-  }
-  
-  // 啟動馬達下降
-  analogWrite(PWM_PIN, pwmSpeed);
-  currentState = MOVING_DOWN;
-  systemLocked = true;
-  lockStartTime = millis();
-  
-  playBeep(NOTE_A5, 100);
-  Serial.println(F("[馬達] 開始下降"));
+if (currentState == HOMING || homingPhase != HOMING_COMPLETED) {
+Serial.println(F(”[控制] Homing 未完成,拒絕”));
+return;
+}
+
+if (pwmManualOverride) {
+Serial.println(F(”[控制] PWM 手動關閉,拒絕”));
+return;
+}
+
+if (systemLocked) {
+Serial.println(F(”[控制] 系統鎖定,拒絕”));
+return;
+}
+
+if (currentState == MOVING_DOWN) {
+Serial.println(F(”[控制] 已在下降中”));
+return;
+}
+
+if (currentState == AT_BOTTOM) {
+Serial.println(F(”[控制] 已在下限”));
+return;
+}
+
+analogWrite(PWM_PIN, pwmSpeed);
+currentState = MOVING_DOWN;
+systemLocked = true;
+lockStartTime = millis();
+playBeep(NOTE_A5, 100);
+Serial.print(F(”[馬達] 下降 PWM=”));
+Serial.println(pwmSpeed);
 }
 
 void stopMotor() {
-  analogWrite(PWM_PIN, 0);
-  Serial.println(F("[馬達] 停止"));
+analogWrite(PWM_PIN, 0);
+Serial.println(F(”[馬達] 停止”));
 }
 
 // ============================================================================
-// 自動升降邏輯
+// 自動升降
 // ============================================================================
 void checkAutoLift() {
-  // 只在下限位置時才檢查自動升降
-  if (currentState != AT_BOTTOM) {
-    speedTimerRunning = false;
-    speedAboveThresholdTime = 0;
-    return;
-  }
-  
-  // 如果本次已完成升降，不再重複
-  if (autoLiftDone) {
-    return;
-  }
-  
-  // 手動模式下不執行自動升降
-  if (pwmManualOverride) {
-    return;
-  }
-  
-  // 檢查速度是否達標
-  if (currentSpeed >= AUTO_LIFT_SPEED) {
-    if (!speedTimerRunning) {
-      // 首次達標，開始計時
-      speedTimerRunning = true;
-      speedAboveThresholdTime = millis();
-      Serial.println(F("[自動] 速度達標，開始計時"));
-    } else {
-      // 檢查是否持續足夠時間
-      unsigned long elapsed = millis() - speedAboveThresholdTime;
-      if (elapsed >= SPEED_HOLD_TIME) {
-        Serial.println(F("[自動] 持續1秒，開始升降！"));
-        startMotorUp();
-        autoLiftDone = true;
-        speedTimerRunning = false;
-        playBeep(NOTE_C5, 200);
-      }
-    }
-  } else {
-    // 速度降低，重置計時器
-    if (speedTimerRunning) {
-      Serial.println(F("[自動] 速度降低，重置計時"));
-    }
-    speedTimerRunning = false;
-    speedAboveThresholdTime = 0;
-  }
+if (currentState == HOMING || homingPhase != HOMING_COMPLETED) {
+return;
+}
+
+if (currentState != AT_BOTTOM) {
+speedTimerRunning = false;
+speedAboveThresholdTime = 0;
+return;
+}
+
+if (autoLiftDone || pwmManualOverride) {
+return;
+}
+
+if (currentSpeed >= AUTO_LIFT_SPEED) {
+if (!speedTimerRunning) {
+speedTimerRunning = true;
+speedAboveThresholdTime = millis();
+Serial.println(F(”[自動] 速度達標,開始計時”));
+} else {
+unsigned long elapsed = millis() - speedAboveThresholdTime;
+if (elapsed >= SPEED_HOLD_TIME) {
+Serial.println(F(”[自動] 持續1秒,啟動升降”));
+startMotorUp();
+autoLiftDone = true;
+speedTimerRunning = false;
+playBeep(NOTE_C5, 200);
+}
+}
+} else {
+if (speedTimerRunning) {
+Serial.println(F(”[自動] 速度降低,重置計時”));
+}
+speedTimerRunning = false;
+speedAboveThresholdTime = 0;
+}
 }
 
 // ============================================================================
-// 紅外線遙控處理
+// 紅外線接收 (統一管理)
 // ============================================================================
-void handleIR(uint32_t code) {
-  // 防彈跳
-  if (millis() - lastIRTime < IR_DELAY) return;
-  lastIRTime = millis();
-  
-  // 任何有效按鍵都切換 PWM 模式
-  if (code != 0 && code != 0xFFFFFFFF) {
-    pwmManualOverride = !pwmManualOverride;
-    
-    if (pwmManualOverride) {
-      analogWrite(PWM_PIN, 0);  // 進入手動模式時停止馬達
-      playBeep(NOTE_C4, 200);
-      Serial.println(F("[紅外] PWM 手動關閉（安全模式）"));
-    } else {
-      playBeep(NOTE_C5, 200);
-      Serial.println(F("[紅外] PWM 自動模式恢復"));
-    }
-  }
+void readIRReceiver() {
+if (IrReceiver.decode()) {
+irCode = IrReceiver.decodedIRData.decodedRawData;
+if (irCode != 0 && irCode != 0xFFFFFFFF) {
+irDataAvailable = true;
+}
+IrReceiver.resume();
+}
+}
+
+void handleIR() {
+if (!irDataAvailable) return;
+if (millis() - lastIRTime < IR_DELAY) {
+irDataAvailable = false;
+return;
+}
+
+lastIRTime = millis();
+irDataAvailable = false;
+
+// Homing 進行中 - 紅外線可跳過
+if (currentState == HOMING && homingPhase == HOMING_MOVING) {
+analogWrite(PWM_PIN, 0);
+homingEnabled = false;
+homingPhase = HOMING_COMPLETED;
+currentState = AT_BOTTOM;
+playBeep(NOTE_C4, 200);
+Serial.println(F(”[紅外] 使用者跳過 Homing”));
+Serial.println(F(”  系統假設當前在下限位置”));
+return;
+}
+
+// 正常模式 - 切換 PWM 開/關
+pwmManualOverride = !pwmManualOverride;
+
+if (pwmManualOverride) {
+analogWrite(PWM_PIN, 0);
+playBeep(NOTE_C4, 200);
+Serial.println(F(”[紅外] PWM 手動關閉 (安全模式)”));
+} else {
+playBeep(NOTE_C5, 200);
+Serial.println(F(”[紅外] PWM 自動模式恢復”));
+}
 }
 
 // ============================================================================
-// 實體按鈕處理
+// 按鈕處理
 // ============================================================================
 void checkButton() {
-  bool buttonState = digitalRead(BUTTON_PIN);
-  
-  // 偵測按鈕按下（下降緣）
-  if (buttonState == LOW && lastButtonState == HIGH) {
-    if (millis() - lastButtonPress > BUTTON_DEBOUNCE) {
-      lastButtonPress = millis();
-      
-      // 切換到下一頁（0->1->2->0）
-      currentPage = (currentPage + 1) % 3;
-      
-      playBeep(NOTE_A5, 50);
-      
-      Serial.print(F("[按鈕] 切換到頁面 "));
-      Serial.println(currentPage);
-    }
-  }
-  
-  lastButtonState = buttonState;
+bool buttonState = digitalRead(BUTTON_PIN);
+
+if (buttonState == LOW && lastButtonState == HIGH) {
+if (millis() - lastButtonPress > BUTTON_DEBOUNCE) {
+lastButtonPress = millis();
+currentPage = (currentPage + 1) % 3;
+playBeep(NOTE_A5, 50);
+Serial.print(F(”[按鈕] 切換至頁面 “));
+Serial.println(currentPage);
+}
+}
+lastButtonState = buttonState;
 }
 
 // ============================================================================
-// OLED 顯示 - 三頁模式
+// OLED 顯示
 // ============================================================================
 void drawMainPage() {
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  
-  // 標題
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.print(F("bike v9.1"));
-  
-  if (pwmManualOverride) {
-    display.setCursor(80, 0);
-    display.print(F("[safe!!!]"));
-  }
-  
-  display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
-  
-  // 狀態（大字）
-  display.setTextSize(2);
-  display.setCursor(0, 12);
-  switch(currentState) {
-    case AT_TOP:
-      display.print(F("up max"));
-      break;
-    case AT_BOTTOM:
-      display.print(F("down max"));
-      break;
-    case MOVING_UP:
-      display.print(F("up"));
-      break;
-    case MOVING_DOWN:
-      display.print(F("down"));
-      break;
-  }
-  
-  display.drawLine(0, 28, 127, 28, SSD1306_WHITE);
-  
-  // 速度 + 角度（並排）
-  display.setTextSize(1);
-  display.setCursor(0, 31);
-  display.print(F("speed:"));
-  
-  display.setTextSize(2);
-  display.setCursor(0, 40);
-  int speedInt = (int)currentSpeed;
-  if (speedInt < 10) display.print(F(" "));
-  display.print(speedInt);
-  
-  display.setTextSize(1);
-  display.setCursor(30, 44);
-  display.print(F("km/h"));
-  
-  // 角度
-  display.setCursor(70, 31);
-  display.print(F("deg:"));
-  
-  display.setTextSize(2);
-  display.setCursor(70, 40);
-  int angleInt = (int)tiltAngle;
-  if (angleInt >= 0 && angleInt < 10) display.print(F(" "));
-  display.print(angleInt);
-  
-  display.setTextSize(1);
-  display.setCursor(100, 44);
-  display.print(F("o"));
-  
-  // 警告指示
-  if (abs(tiltAngle) >= TILT_DANGER) {
-    display.fillRect(110, 31, 18, 10, SSD1306_WHITE);
-    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    display.setCursor(112, 32);
-    display.print(F("warn!"));
-    display.setTextColor(SSD1306_WHITE);
-  } else if (abs(tiltAngle) >= TILT_WARNING) {
-    display.setCursor(112, 32);
-    display.print(F("warn"));
-  }
-  
-  display.drawLine(0, 52, 127, 52, SSD1306_WHITE);
-  
-  // 自動升降指示 + PWM
-  display.setCursor(0, 54);
-  display.print(F("PWM:"));
-  display.print(pwmSpeed);
-  
-  if (speedTimerRunning) {
-    unsigned long elapsed = millis() - speedAboveThresholdTime;
-    unsigned long remaining = (SPEED_HOLD_TIME - elapsed) / 100;
-    
-    display.setCursor(60, 54);
-    display.print(F("auto:"));
-    display.print(remaining / 10);
-    display.print(F("."));
-    display.print(remaining % 10);
-  }
-  
-  display.display();
+display.clearDisplay();
+display.setTextColor(SSD1306_WHITE);
+
+display.setTextSize(1);
+display.setCursor(0, 0);
+display.print(F(“Bike v9.3”));
+
+if (pwmManualOverride) {
+display.setCursor(80, 0);
+display.print(F(”[SAFE]”));
+}
+
+display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
+
+if (currentState == HOMING) {
+display.setTextSize(2);
+display.setCursor(10, 20);
+display.print(F(“HOMING”));
+
+```
+display.setTextSize(1);
+display.setCursor(10, 40);
+
+switch(homingPhase) {
+  case HOMING_NOT_STARTED:
+    display.print(F("Waiting..."));
+    break;
+  case HOMING_MOVING:
+    {
+      unsigned long elapsed = millis() - homingStartTime;
+      display.print(F("Moving "));
+      display.print(elapsed / 1000);
+      display.print(F("s"));
+    }
+    break;
+  case HOMING_COMPLETED:
+    display.print(F("Completed!"));
+    break;
+  case HOMING_FAILED:
+    display.print(F("FAILED!"));
+    break;
+}
+
+display.setCursor(10, 52);
+display.print(F("IR: Skip"));
+
+display.display();
+return;
+```
+
+}
+
+display.setTextSize(2);
+display.setCursor(0, 12);
+switch(currentState) {
+case AT_TOP: display.print(F(“AT TOP”)); break;
+case AT_BOTTOM: display.print(F(“AT BTM”)); break;
+case MOVING_UP: display.print(F(“UP”)); break;
+case MOVING_DOWN: display.print(F(“DOWN”)); break;
+default: break;
+}
+
+display.drawLine(0, 28, 127, 28, SSD1306_WHITE);
+
+display.setTextSize(1);
+display.setCursor(0, 31);
+display.print(F(“Speed:”));
+
+display.setTextSize(2);
+display.setCursor(0, 40);
+int speedInt = (int)currentSpeed;
+if (speedInt < 10) display.print(F(” “));
+display.print(speedInt);
+
+display.setTextSize(1);
+display.setCursor(30, 44);
+display.print(F(“km/h”));
+
+display.setCursor(70, 31);
+display.print(F(“Angle:”));
+
+display.setTextSize(2);
+display.setCursor(70, 40);
+int angleInt = (int)tiltAngle;
+if (angleInt >= 0 && angleInt < 10) display.print(F(” “));
+display.print(angleInt);
+
+display.setTextSize(1);
+display.setCursor(100, 44);
+display.print(F(“o”));
+
+if (abs(tiltAngle) >= TILT_DANGER) {
+display.fillRect(110, 31, 18, 10, SSD1306_WHITE);
+display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+display.setCursor(112, 32);
+display.print(F(”!!!”));
+display.setTextColor(SSD1306_WHITE);
+}
+
+display.drawLine(0, 52, 127, 52, SSD1306_WHITE);
+
+display.setCursor(0, 54);
+display.print(F(“PWM:”));
+display.print(pwmSpeed);
+
+if (speedTimerRunning) {
+unsigned long elapsed = millis() - speedAboveThresholdTime;
+unsigned long remaining = (SPEED_HOLD_TIME - elapsed) / 100;
+display.setCursor(60, 54);
+display.print(F(“Auto:”));
+display.print(remaining / 10);
+display.print(F(”.”));
+display.print(remaining % 10);
+}
+
+display.display();
 }
 
 void drawDebugPage() {
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.print(F("DEBUG"));
-  
-  display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
-  
-  // 限位開關狀態
-  display.setCursor(0, 12);
-  display.print(F("Limit: ["));
-  display.print(upperLimit ? F("UP") : F("-"));
-  display.print(F("]["));
-  display.print(lowerLimit ? F("DN") : F("-"));
-  display.print(F("]"));
-  
-  // 系統鎖定
-  display.setCursor(0, 22);
-  display.print(F("Lock: "));
-  display.print(systemLocked ? F("YES") : F("NO"));
-  
-  // 自動升降狀態
-  display.setCursor(0, 32);
-  display.print(F("Auto: "));
-  if (autoLiftDone) {
-    display.print(F("DONE"));
-  } else if (speedTimerRunning) {
-    display.print(F("TIMING"));
-  } else {
-    display.print(F("IDLE"));
-  }
-  
-  // 速度詳細
-  display.setCursor(0, 42);
-  display.print(F("Spd: "));
-  display.print(currentSpeed, 1);
-  display.print(F(" km/h"));
-  
-  // 角度詳細
-  display.setCursor(0, 52);
-  display.print(F("Ang: "));
-  display.print(tiltAngle, 1);
-  display.print(F(" deg"));
-  
-  if (abs(tiltAngle) >= TILT_DANGER) {
-    display.print(F(" !!!"));
-  } else if (abs(tiltAngle) >= TILT_WARNING) {
-    display.print(F(" !"));
-  }
-  
-  display.display();
+display.clearDisplay();
+display.setTextColor(SSD1306_WHITE);
+display.setTextSize(1);
+
+display.setCursor(0, 0);
+display.print(F(“DEBUG v9.3”));
+display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
+
+display.setCursor(0, 12);
+display.print(F(“Homing: “));
+switch(homingPhase) {
+case HOMING_NOT_STARTED: display.print(F(“START”)); break;
+case HOMING_MOVING: display.print(F(“MOVE”)); break;
+case HOMING_COMPLETED: display.print(F(“DONE”)); break;
+case HOMING_FAILED: display.print(F(“FAIL”)); break;
 }
 
-void drawSystemInfoPage() {
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.print(F("SYSTEM INFO"));
-  
-  display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
-  
-  // PWM 模式狀態
-  display.setCursor(0, 12);
-  display.print(F("PWM mode: "));
-  if (pwmManualOverride) {
-    display.print(F("MANUAL"));
-    display.setCursor(0, 22);
-    display.print(F("(SAFE OFF)"));
-  } else {
-    display.print(F("AUTO"));
-  }
-  
-  // 運行時間
-  display.setCursor(0, 32);
-  display.print(F("Uptime: "));
-  unsigned long seconds = millis() / 1000;
-  unsigned long minutes = seconds / 60;
-  unsigned long hours = minutes / 60;
-  display.print(hours);
-  display.print(F("h "));
-  display.print(minutes % 60);
-  display.print(F("m"));
-  
-  // PWM 數值
-  display.setCursor(0, 42);
-  display.print(F("PWM val: "));
-  display.print(pwmSpeed);
-  
-  // 版本
-  display.setCursor(0, 52);
-  display.print(F("Version: 9.1"));
-  
-  display.display();
-}
+display.setCursor(0, 22);
+display.print(F(“Limit: [”));
+display.print(upperLimit ? F(“UP”) : F(”-”));
+display.print(F(”][”));
+display.print(lowerLimit ? F(“DN”) : F(”-”));
+display.print(F(”]”));
 
-void updateDisplay() {
-  if (millis() - lastDisplayUpdate < 250) return;
-  lastDisplayUpdate = millis();
-  
-  switch(currentPage) {
-    case 0:
-      drawMainPage();
-      break;
-    case 1:
-      drawDebugPage();
-      break;
-    case 2:
-      drawSystemInfoPage();
-      break;
-  }
-}
-
-
-// ============================================================================
-// 初始化設定
-// ============================================================================
-void setup() {
-  wdt_disable();
-  Serial.begin(115200);
-  delay(100);
-  
-  // 腳位初始化
-  pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(PWM_PIN, OUTPUT);
-  pinMode(LIMIT_UP_PIN, INPUT_PULLUP);
-  pinMode(LIMIT_DOWN_PIN, INPUT_PULLUP);
-  pinMode(HALL_SPEED_PIN, INPUT_PULLUP);
-  pinMode(SPEED_CONTROL_PIN, INPUT);
-  pinMode(RGB_RED_PIN, OUTPUT);
-  pinMode(RGB_GREEN_PIN, OUTPUT);
-  pinMode(RGB_BLUE_PIN, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  
-  // 確保馬達停止
-  analogWrite(PWM_PIN, 0);
-  setRGB(0, 0, 0);
-  
-  // 中斷與週邊設定
-  attachInterrupt(digitalPinToInterrupt(HALL_SPEED_PIN), speedInterrupt, FALLING);
-  IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
-  
-  // OLED 初始化
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("OLED 初始化失敗！"));
-    while(1);
-  }
-  
-  // 啟動畫面
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(2);
-  display.setCursor(10, 10);
-  display.print(F("BIKE"));
-  display.setTextSize(1);
-  display.setCursor(10, 35);
-  display.print(F("v9.1"));
-  display.display();
-  delay(1500);
-  
-  playStartupMusic();
-  
-  // IMU 初始化
-  setupIMU();
-  
-  Serial.println(F("===================================="));
-  Serial.println(F("  智能輔助輪 v9.1"));
-  Serial.println(F("===================================="));
-  Serial.println(F("\n[核心功能]"));
-  Serial.println(F("- 速度 >= 15 km/h 持續 1 秒 -> 自動升降"));
-  Serial.println(F("- 限位開關絕對優先"));
-  Serial.println(F("- 傾斜 > 10度警告 / > 15度危險"));
-  Serial.println(F("- 單一鎖定機制"));
-  Serial.println(F("- 三頁 OLED (主頁/除錯/系統)"));
-  Serial.println(F("===================================="));
-  Serial.println(F("\n[控制方式]"));
-  Serial.println(F("紅外遙控 -> 任意按鍵切換 PWM 開/關"));
-  Serial.println(F("按鈕(Pin12) -> 切換 OLED 頁面"));
-  Serial.println(F("====================================\n"));
-  
-  // ============================================
-  // PWM 模組自我測試
-  // ============================================
-  Serial.println(F("\n[PWM 模組自我測試]"));
-  
-  // 檢查限位開關狀態
-  bool upperRaw = (digitalRead(LIMIT_UP_PIN) == LOW);
-  bool lowerRaw = (digitalRead(LIMIT_DOWN_PIN) == LOW);
-  
-  if (upperRaw || lowerRaw) {
-    Serial.println(F("警告: 限位開關觸發，跳過 PWM 測試"));
-    if (upperRaw) Serial.println(F("  -> 目前在上限位置"));
-    if (lowerRaw) Serial.println(F("  -> 目前在下限位置"));
-  } else {
-    Serial.println(F(">> 開始 PWM 測試 (200 PWM, 最長100ms)"));
-    
-    // 測試期間白光指示
-    setRGB(255, 255, 255);
-    
-    // 啟動 PWM
-    analogWrite(PWM_PIN, 200);
-    
-    // 安全延遲：每10ms檢查一次限位開關
-    unsigned long testStart = millis();
-    bool limitTriggered = false;
-    
-    while (millis() - testStart < 100) {
-      // 持續檢查限位開關
-      upperRaw = (digitalRead(LIMIT_UP_PIN) == LOW);
-      lowerRaw = (digitalRead(LIMIT_DOWN_PIN) == LOW);
-      
-      if (upperRaw || lowerRaw) {
-        Serial.println(F("  -> 偵測到限位觸發，立即停止測試"));
-        limitTriggered = true;
-        break;
-      }
-      
-      delay(10);  // 每10ms檢查一次
-    }
-    
-    // 立即停止 PWM
-    analogWrite(PWM_PIN, 0);
-    
-    // 關閉 LED
-    setRGB(0, 0, 0);
-    
-    if (limitTriggered) {
-      Serial.println(F("警告: 測試期間觸發限位，請檢查機構"));
-    } else {
-      Serial.println(F("OK: PWM 測試完成"));
-      Serial.println(F("  如果馬達有短暫啟動，模組正常工作"));
-    }
-    
-    delay(500);
-  }
-  
-  Serial.println(F("===================================="));
-  Serial.println(F("系統就緒！\n"));
-  
-  wdt_enable(WDTO_2S);
-}
-
-// ============================================================================
-// 主迴圈
-// ============================================================================
-void loop() {
-  wdt_reset();
-  
-  // ========== 優先級1: 安全檢查 ==========
-  checkLimitSwitches();
-  
-  if (upperLimit || lowerLimit) {
-    updateDisplay();
-    updateRGBByState();
-    delay(10);
-    return;
-  }
-  
-  // ========== 優先級2: 更新資料 ==========
-  updateSpeed();
-  readIMU();
-  
-  // 讀取 PWM 設定旋鈕
-  if (millis() - lastSpeedRead > 100) {
-    lastSpeedRead = millis();
-    int raw = analogRead(SPEED_CONTROL_PIN);
-    pwmSpeed = map(raw, 0, 1023, 100, 255);
-    pwmSpeed = constrain(pwmSpeed, 100, 255);
-  }
-  
-  // ========== 優先級3: 解鎖檢查 ==========
-  if (systemLocked && millis() - lockStartTime > LOCK_DURATION) {
-    systemLocked = false;
-    Serial.println(F("[系統] 已解鎖"));
-  }
-  
-  // ========== 優先級4: 自動升降 ==========
-  checkAutoLift();
-  
-  // ========== 優先級5: 紅外線控制 ==========
-  if (IrReceiver.decode()) {
-    handleIR(IrReceiver.decodedIRData.decodedRawData);
-    IrReceiver.resume();
-  }
-  
-  // ========== 優先級6: 實體按鈕 ==========
-  checkButton();
-  
-  // ========== 優先級7: 傾斜警告 ==========
-  checkTiltWarning();
-  
-  // ========== 介面更新 ==========
-  updateDisplay();
-  updateRGBByState();
-  
-  // ========== 序列埠輸出（每1秒） ==========
-  if (millis() - lastSerialPrint > 1000) {
-    lastSerialPrint = millis();
-    
-    Serial.print(F("狀態:"));
-    switch(currentState) {
-      case AT_TOP: Serial.print(F("上限")); break;
-      case AT_BOTTOM: Serial.print(F("下限")); break;
-      case MOVING_UP: Serial.print(F("上升")); break;
-      case MOVING_DOWN: Serial.print(F("下降")); break;
-    }
-    
-    Serial.print(F(" |限位:["));
-    Serial.print(upperLimit ? F("上") : F("-"));
-    Serial.print(F("]["));
-    Serial.print(lowerLimit ? F("下") : F("-"));
-    Serial.print(F("]"));
-    
-    Serial.print(F(" |速度:"));
-    Serial.print(currentSpeed, 1);
-    Serial.print(F("km/h"));
-    
-    Serial.print(F(" |角度:"));
-    Serial.print(tiltAngle, 1);
-    Serial.print(F("度"));
-    
-    // PWM 診斷
-    Serial.print(F(" |PWM設定:"));
-    Serial.print(pwmSpeed);
-    
-    Serial.print(F(" |旋鈕原始值:"));
-    Serial.print(analogRead(SPEED_CONTROL_PIN));
-    
-    if (speedTimerRunning) {
-      unsigned long elapsed = millis() - speedAboveThresholdTime;
-      Serial.print(F(" |計時:"));
-      Serial.print(elapsed / 100);
-      Serial.print(F("/10"));
-    }
-    
-    Serial.print(F(" |鎖定:"));
-    Serial.print(systemLocked ? F("是") : F("否"));
-    
-    if (pwmManualOverride) {
-      Serial.print(F(" |PWM:手動關閉"));
-    }
-    
-    Serial.print(F(" |頁面:"));
-    Serial.print(currentPage);
-    
-    Serial.println();
-  }
-  delay(5);
-}
+display.setCursor(0, 32);
+display.print(F(“Lock: “));
+display.print(systemLocked ? F(“YES”) : F(“NO”));
+display.print(F(”  Auto: “));
+if (autoLiftDone) {
