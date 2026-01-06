@@ -1,27 +1,22 @@
 // ============================================================================
-// 輔助輪 v9.7 - 繼電器版本 (修正版)
+// 輔助輪 v9.7 - 中文顯示版
 // 改進項目：
-// 1. ✓ 移除所有 PWM 控制邏輯
-// 2. ✓ 改用繼電器數位開關控制馬達
-// 3. ✓ 簡化速度邏輯(開/關)
-// 4. ✓ 保留所有安全機制
-// 5. ✓ 修正命名衝突問題
+// 1. ✓ 改用 U8g2 庫支援中文顯示
+// 2. ✓ 混合版面：中文狀態描述 + 英文數據
+// 3. ✓ 優化版面配置適應中文字型
+// 4. ✓ 保留所有原有功能
 // ============================================================================
+#include <Arduino.h>
+#include <stdint.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <U8g2lib.h>
 #include <IRremote.h>
 #include <avr/wdt.h>
 
 // ============================================================================
-// 常數定義
-// ============================================================================
-
 // OLED 設定
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET -1
-#define OLED_ADDRESS 0x3C
+// ============================================================================
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 
 // 音符定義
 #define NOTE_C4  262
@@ -40,7 +35,7 @@
 namespace Pins {
   const byte BUZZER = 1;
   const byte IR_RECEIVE = 9;
-  const byte RELAY_PIN = 7;        // 繼電器控制腳位
+  const byte PWM = 9;
   const byte LIMIT_UP = 52;
   const byte LIMIT_DOWN = 53;
   const byte HALL_SPEED = 2;
@@ -58,10 +53,13 @@ namespace RGB {
   const byte MEDIUM = 200;
 }
 
-// 繼電器控制常數
-namespace RelayControl {
-  const bool MOTOR_ON = HIGH;      // 馬達開啟
-  const bool MOTOR_OFF = LOW;      // 馬達關閉
+// PWM 控制常數
+namespace PWMControl {
+  const int HOMING_SPEED = 180;
+  const int NORMAL_SPEED = 190;
+  const int INCREMENT_STEP = 10;
+  const int DECREMENT_STEP = 20;
+  const int STOPPED = 0;
 }
 
 // 時間常數
@@ -91,12 +89,13 @@ namespace Speed {
 // IMU 相關常數
 namespace IMU {
   const float ACCEL_SCALE = 16384.0;
+  const float RAD_TO_DEG_CONV = 57.2958;  // 避免與 Arduino.h 的 RAD_TO_DEG 衝突
   const float TILT_WARNING_DEGREES = 10.0;
   const float TILT_DANGER_DEGREES = 15.0;
   const int MAX_READ_FAILURES = 5;
 }
 
-// I2C 錯誤碼
+// I2C 錯誤碼說明
 namespace I2C {
   const byte SUCCESS = 0;
   const byte DATA_TOO_LONG = 1;
@@ -124,9 +123,8 @@ enum HomingPhase : byte {
   FAILED
 };
 
-// 修正: 改用不同的名稱避免與 IRremote 的 UNKNOWN 衝突
 enum HomingFailureReason : byte {
-  HOMING_UNKNOWN = 0,
+  HOMING_UNKNOWN = 0,          // 避免與 IRremote 的 UNKNOWN 衝突
   HOMING_TIMEOUT = 1,
   HOMING_LIMIT_SWITCH_ERROR = 2
 };
@@ -140,7 +138,7 @@ struct HomingState {
   unsigned long startTime = 0;
   bool enabled = true;
   HomingFailureReason failureReason = HOMING_UNKNOWN;
-  
+
   void reset() {
     phase = NOT_STARTED;
     startTime = 0;
@@ -150,21 +148,21 @@ struct HomingState {
 };
 
 struct MotorState {
-  bool targetState = RelayControl::MOTOR_OFF;
-  bool currentState = RelayControl::MOTOR_OFF;
+  int targetPWM = PWMControl::STOPPED;
+  int currentPWM = PWMControl::STOPPED;
+  int normalSpeed = PWMControl::NORMAL_SPEED;
   bool manualOverride = false;
-  
-  void setTarget(bool state) {
-    targetState = state;
+
+  void setTarget(int pwm) {
+    targetPWM = constrain(pwm, PWMControl::STOPPED, 255);
   }
-  
-  void update() {
-    currentState = targetState;
-    digitalWrite(Pins::RELAY_PIN, currentState);
-  }
-  
-  bool isRunning() {
-    return currentState == RelayControl::MOTOR_ON;
+
+  void smoothUpdate() {
+    if (currentPWM < targetPWM) {
+      currentPWM = min(currentPWM + PWMControl::INCREMENT_STEP, targetPWM);
+    } else if (currentPWM > targetPWM) {
+      currentPWM = max(currentPWM - PWMControl::DECREMENT_STEP, targetPWM);
+    }
   }
 };
 
@@ -172,11 +170,11 @@ struct LimitSwitchState {
   bool upperTriggered = false;
   bool lowerTriggered = false;
   unsigned long lastCheckTime = 0;
-  
+
   bool needsDebounce() {
     return (millis() - lastCheckTime) < Timing::LIMIT_DEBOUNCE_MS;
   }
-  
+
   void updateCheckTime() {
     lastCheckTime = millis();
   }
@@ -185,16 +183,16 @@ struct LimitSwitchState {
 struct SystemLockState {
   bool locked = false;
   unsigned long lockStartTime = 0;
-  
+
   void lock() {
     locked = true;
     lockStartTime = millis();
   }
-  
+
   void unlock() {
     locked = false;
   }
-  
+
   bool shouldUnlock() {
     return locked && (millis() - lockStartTime > Timing::SYSTEM_LOCK_DURATION_MS);
   }
@@ -206,11 +204,11 @@ struct SpeedMeasurement {
   volatile bool hasNewData = false;
   float currentSpeed = 0.0;
   unsigned long lastUpdateTime = 0;
-  
+
   bool isTimedOut() {
     return (millis() - lastUpdateTime) > Timing::SPEED_TIMEOUT_MS;
   }
-  
+
   void markUpdated() {
     lastUpdateTime = millis();
   }
@@ -220,12 +218,12 @@ struct AutoLiftState {
   unsigned long speedAboveThresholdTime = 0;
   bool timerRunning = false;
   bool liftCompleted = false;
-  
+
   void reset() {
     timerRunning = false;
     speedAboveThresholdTime = 0;
   }
-  
+
   unsigned long getElapsedTime() {
     return timerRunning ? (millis() - speedAboveThresholdTime) : 0;
   }
@@ -236,23 +234,23 @@ struct IMUState {
   unsigned long lastReadTime = 0;
   bool lastWarningState = false;
   int consecutiveReadFailures = 0;
-  
+
   bool needsRead() {
     return (millis() - lastReadTime) >= Timing::IMU_READ_INTERVAL_MS;
   }
-  
+
   void markRead() {
     lastReadTime = millis();
   }
-  
+
   void recordFailure() {
     consecutiveReadFailures++;
   }
-  
+
   void recordSuccess() {
     consecutiveReadFailures = 0;
   }
-  
+
   bool hasExcessiveFailures() {
     return consecutiveReadFailures >= IMU::MAX_READ_FAILURES;
   }
@@ -261,15 +259,15 @@ struct IMUState {
 struct DisplayState {
   byte currentPage = 0;
   unsigned long lastUpdateTime = 0;
-  
+
   bool needsUpdate() {
     return (millis() - lastUpdateTime) >= Timing::DISPLAY_UPDATE_INTERVAL_MS;
   }
-  
+
   void markUpdated() {
     lastUpdateTime = millis();
   }
-  
+
   void nextPage() {
     currentPage = (currentPage + 1) % 3;
   }
@@ -278,8 +276,6 @@ struct DisplayState {
 // ============================================================================
 // 全域物件
 // ============================================================================
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
 SystemState g_systemState = HOMING;
 bool g_testModeEnabled = false;
 
@@ -303,13 +299,13 @@ struct {
 unsigned long g_lastStatusPrint = 0;
 
 // ============================================================================
-// I2C 錯誤訊息
+// 輔助函數：I2C 錯誤訊息
 // ============================================================================
 void printI2CError(byte errorCode) {
   Serial.print(F("I2C 錯誤碼 "));
   Serial.print(errorCode);
   Serial.print(F(": "));
-  
+
   switch(errorCode) {
     case I2C::SUCCESS:
       Serial.println(F("成功"));
@@ -386,8 +382,8 @@ void updateRGBByState() {
     if (millis() - lastBlink > Timing::HOMING_BLINK_INTERVAL_MS) {
       lastBlink = millis();
       blinkState = !blinkState;
-      setRGB(blinkState ? RGB::FULL : RGB::OFF, 
-             RGB::OFF, 
+      setRGB(blinkState ? RGB::FULL : RGB::OFF,
+             RGB::OFF,
              blinkState ? RGB::FULL : RGB::OFF);
     }
     return;
@@ -437,7 +433,7 @@ bool initializeIMU() {
   Wire.write(PWR_MGMT_1);
   Wire.write(0x00);
   byte error = Wire.endTransmission();
-  
+
   if (error == I2C::SUCCESS) {
     Serial.println(F("IMU 初始化成功"));
     g_imu.recordSuccess();
@@ -454,7 +450,7 @@ bool readIMUData(int16_t& accelX, int16_t& accelY, int16_t& accelZ) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(ACCEL_XOUT_H);
   byte error = Wire.endTransmission(false);
-  
+
   if (error != I2C::SUCCESS) {
     Serial.print(F("[IMU] 讀取失敗 - "));
     printI2CError(error);
@@ -470,15 +466,14 @@ bool readIMUData(int16_t& accelX, int16_t& accelY, int16_t& accelZ) {
   accelX = (Wire.read() << 8) | Wire.read();
   accelY = (Wire.read() << 8) | Wire.read();
   accelZ = (Wire.read() << 8) | Wire.read();
-  
+
   return true;
 }
 
 float calculateTiltAngle(int16_t accelX, int16_t accelZ) {
   float ax = accelX / IMU::ACCEL_SCALE;
   float az = accelZ / IMU::ACCEL_SCALE;
-  // 修正: 直接使用 Arduino 內建的 RAD_TO_DEG
-  float angle = atan2(ax, az) * RAD_TO_DEG;
+  float angle = atan2(ax, az) * IMU::RAD_TO_DEG_CONV;
   return constrain(angle, -90.0, 90.0);
 }
 
@@ -487,14 +482,14 @@ void updateIMUReading() {
   g_imu.markRead();
 
   int16_t accelX, accelY, accelZ;
-  
+
   if (readIMUData(accelX, accelY, accelZ)) {
     g_imu.tiltAngle = calculateTiltAngle(accelX, accelZ);
     g_imu.recordSuccess();
   } else {
     g_imu.recordFailure();
     g_imu.tiltAngle = 0.0;
-    
+
     if (g_imu.hasExcessiveFailures()) {
       Serial.println(F("[錯誤] IMU 連續讀取失敗，嘗試重新初始化"));
       initializeIMU();
@@ -504,7 +499,7 @@ void updateIMUReading() {
 
 void checkTiltWarning() {
   if (g_systemState == HOMING) return;
-  
+
   float absoluteTilt = abs(g_imu.tiltAngle);
   bool currentWarning = (absoluteTilt >= IMU::TILT_WARNING_DEGREES);
 
@@ -513,7 +508,7 @@ void checkTiltWarning() {
       playWarning();
       Serial.print(F("[警告] 危險傾斜: "));
       Serial.println(g_imu.tiltAngle, 1);
-      g_motor.setTarget(RelayControl::MOTOR_ON);
+      g_motor.setTarget(g_motor.normalSpeed);
       g_systemState = MOVING_DOWN;
     } else {
       playTone(NOTE_A5, 200);
@@ -540,7 +535,7 @@ void updateSpeedMeasurement() {
   if (g_speed.hasNewData) {
     if (g_speed.pulseInterval > 0) {
       float rawSpeed = calculateSpeedFromInterval(g_speed.pulseInterval);
-      
+
       if (isSpeedReasonable(rawSpeed)) {
         g_speed.currentSpeed = rawSpeed;
       }
@@ -594,7 +589,7 @@ void updateLimitSwitchesAndSystemState() {
 }
 
 void handleBothLimitsSwitchesTriggered() {
-  g_motor.setTarget(RelayControl::MOTOR_OFF);
+  g_motor.setTarget(PWMControl::STOPPED);
   g_systemState = AT_TOP;
   g_systemLock.lock();
 
@@ -608,7 +603,7 @@ void handleBothLimitsSwitchesTriggered() {
 }
 
 void handleUpperLimitTriggered() {
-  g_motor.setTarget(RelayControl::MOTOR_OFF);
+  g_motor.setTarget(PWMControl::STOPPED);
 
   if (g_systemState == HOMING && g_homing.phase == MOVING) {
     g_homing.phase = COMPLETED;
@@ -628,7 +623,7 @@ void handleUpperLimitTriggered() {
 }
 
 void handleLowerLimitTriggered() {
-  g_motor.setTarget(RelayControl::MOTOR_OFF);
+  g_motor.setTarget(PWMControl::STOPPED);
 
   if (g_systemState == HOMING && g_homing.phase == MOVING) {
     g_homing.phase = COMPLETED;
@@ -651,6 +646,8 @@ void handleLowerLimitTriggered() {
 void startHomingSequence() {
   Serial.println(F("\n[Homing] 開始歸位流程"));
   Serial.println(F("  策略: 向下移動至下限位"));
+  Serial.print(F("  PWM: "));
+  Serial.println(PWMControl::HOMING_SPEED);
   Serial.print(F("  逾時: "));
   Serial.print(Timing::HOMING_TIMEOUT_MS / 1000);
   Serial.println(F("秒"));
@@ -664,8 +661,8 @@ void startHomingSequence() {
     playHomingComplete();
     Serial.println(F("[Homing] 已在下限,直接完成"));
     return;
-  } 
-  
+  }
+
   if (upperNow && lowerNow) {
     g_homing.phase = FAILED;
     g_homing.failureReason = HOMING_LIMIT_SWITCH_ERROR;
@@ -675,7 +672,7 @@ void startHomingSequence() {
     return;
   }
 
-  g_motor.setTarget(RelayControl::MOTOR_ON);
+  g_motor.setTarget(PWMControl::HOMING_SPEED);
   g_homing.phase = MOVING;
   g_homing.startTime = millis();
   Serial.println(F("[Homing] 馬達已啟動"));
@@ -697,9 +694,9 @@ void updateHomingProgress() {
 
 void checkHomingTimeout() {
   unsigned long elapsedTime = millis() - g_homing.startTime;
-  
+
   if (elapsedTime > Timing::HOMING_TIMEOUT_MS) {
-    g_motor.setTarget(RelayControl::MOTOR_OFF);
+    g_motor.setTarget(PWMControl::STOPPED);
     g_homing.phase = FAILED;
     g_homing.failureReason = HOMING_TIMEOUT;
     g_systemState = AT_BOTTOM;
@@ -765,14 +762,15 @@ void checkAutoLiftConditions() {
 
 void startAutoLiftAndUpdateState() {
   Serial.println(F("[自動] 持續1秒,啟動升降"));
-  
+
   if (!g_systemLock.locked) {
-    g_motor.setTarget(RelayControl::MOTOR_ON);
+    g_motor.setTarget(g_motor.normalSpeed);
     g_systemState = MOVING_UP;
     g_autoLift.liftCompleted = true;
     g_autoLift.reset();
     playTone(NOTE_C5, 200);
-    Serial.println(F("[馬達] 自動上升"));
+    Serial.print(F("[馬達] 自動上升 PWM="));
+    Serial.println(g_motor.normalSpeed);
   }
 }
 
@@ -808,7 +806,7 @@ void handleIRCommand() {
 }
 
 void skipHomingSequence() {
-  g_motor.setTarget(RelayControl::MOTOR_OFF);
+  g_motor.setTarget(PWMControl::STOPPED);
   g_homing.enabled = false;
   g_homing.phase = COMPLETED;
   g_systemState = AT_BOTTOM;
@@ -821,12 +819,35 @@ void toggleManualOverride() {
   g_motor.manualOverride = !g_motor.manualOverride;
 
   if (g_motor.manualOverride) {
-    g_motor.setTarget(RelayControl::MOTOR_OFF);
     playTone(NOTE_C4, 200);
-    Serial.println(F("[紅外] 馬達手動關閉 (安全模式)"));
+    Serial.println(F("[紅外] 進入手動模式"));
+
+    // 手動模式：根據當前狀態決定動作
+    if (g_systemState == AT_BOTTOM || g_systemState == MOVING_DOWN) {
+      // 在下限或下降中 → 切換為上升
+      if (!g_limits.upperTriggered) {
+        g_motor.setTarget(g_motor.normalSpeed);
+        g_systemState = MOVING_UP;
+        Serial.println(F("[手動] 啟動上升"));
+      } else {
+        Serial.println(F("[手動] 已在上限，無法上升"));
+        g_motor.setTarget(PWMControl::STOPPED);
+      }
+    } else if (g_systemState == AT_TOP || g_systemState == MOVING_UP) {
+      // 在上限或上升中 → 切換為下降
+      if (!g_limits.lowerTriggered) {
+        g_motor.setTarget(g_motor.normalSpeed);
+        g_systemState = MOVING_DOWN;
+        Serial.println(F("[手動] 啟動下降"));
+      } else {
+        Serial.println(F("[手動] 已在下限，無法下降"));
+        g_motor.setTarget(PWMControl::STOPPED);
+      }
+    }
   } else {
     playTone(NOTE_C5, 200);
-    Serial.println(F("[紅外] 馬達自動模式恢復"));
+    Serial.println(F("[紅外] 退出手動模式，恢復自動"));
+    g_motor.setTarget(PWMControl::STOPPED);
   }
 }
 
@@ -850,162 +871,215 @@ void checkButtonPress() {
 // ============================================================================
 void executeMotorControl() {
   if (g_systemState == HOMING && g_homing.phase == MOVING) {
-    g_motor.setTarget(RelayControl::MOTOR_ON);
+    g_motor.setTarget(PWMControl::HOMING_SPEED);
   } else if (g_systemState == HOMING) {
-    g_motor.setTarget(RelayControl::MOTOR_OFF);
+    g_motor.setTarget(PWMControl::STOPPED);
   } else if (g_motor.manualOverride) {
-    g_motor.setTarget(RelayControl::MOTOR_OFF);
+    // 手動模式：維持當前 target，不自動停止
+    // PWM 已在 toggleManualOverride() 中設定
   } else if (g_systemState == AT_TOP || g_systemState == AT_BOTTOM) {
-    g_motor.setTarget(RelayControl::MOTOR_OFF);
+    g_motor.setTarget(PWMControl::STOPPED);
   } else if (g_systemState == MOVING_UP || g_systemState == MOVING_DOWN) {
-    g_motor.setTarget(RelayControl::MOTOR_ON);
-    
+    g_motor.setTarget(g_motor.normalSpeed);
+
     if (g_limits.upperTriggered && g_systemState == MOVING_UP) {
-      g_motor.setTarget(RelayControl::MOTOR_OFF);
+      g_motor.setTarget(PWMControl::STOPPED);
       g_systemState = AT_TOP;
     }
     if (g_limits.lowerTriggered && g_systemState == MOVING_DOWN) {
-      g_motor.setTarget(RelayControl::MOTOR_OFF);
+      g_motor.setTarget(PWMControl::STOPPED);
       g_systemState = AT_BOTTOM;
     }
   }
 
-  // 更新繼電器狀態
-  bool previousState = g_motor.currentState;
-  g_motor.update();
+  // 即使在手動模式，也要檢查限位開關
+  if (g_motor.manualOverride) {
+    if (g_limits.upperTriggered && g_systemState == MOVING_UP) {
+      g_motor.setTarget(PWMControl::STOPPED);
+      g_systemState = AT_TOP;
+      g_motor.manualOverride = false;  // 到達限位，自動退出手動模式
+      Serial.println(F("[手動] 到達上限，自動停止"));
+    }
+    if (g_limits.lowerTriggered && g_systemState == MOVING_DOWN) {
+      g_motor.setTarget(PWMControl::STOPPED);
+      g_systemState = AT_BOTTOM;
+      g_motor.manualOverride = false;  // 到達限位，自動退出手動模式
+      Serial.println(F("[手動] 到達下限，自動停止"));
+    }
+  }
 
-  // 只在狀態改變時印出訊息
-  if (g_motor.currentState != previousState) {
-    Serial.print(F("[繼電器] 馬達: "));
-    Serial.println(g_motor.isRunning() ? F("開啟") : F("關閉"));
+  g_motor.smoothUpdate();
+  analogWrite(Pins::PWM, g_motor.currentPWM);
+
+  static int lastOutputPWM = -1;
+  if (g_motor.currentPWM != lastOutputPWM) {
+    Serial.print(F("[PWM] 輸出: "));
+    Serial.print(g_motor.currentPWM);
+    Serial.print(F(" (目標: "));
+    Serial.print(g_motor.targetPWM);
+    Serial.println(F(")"));
+    lastOutputPWM = g_motor.currentPWM;
   }
 }
 
 // ============================================================================
-// OLED 顯示
+// OLED 顯示 - 中文版
 // ============================================================================
 void drawMainPage() {
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.print(F("Bike v9.7"));
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_unifont_t_chinese1);
+
+  // 標題列
+  u8g2.setCursor(0, 10);
+  u8g2.print("腳踏車 v9.7");
 
   if (g_motor.manualOverride) {
-    display.setCursor(80, 0);
-    display.print(F("[SAFE]"));
+    u8g2.setCursor(90, 10);
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.print("[SAFE]");
+    u8g2.setFont(u8g2_font_unifont_t_chinese1);
   }
 
-  display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
+  u8g2.drawLine(0, 12, 127, 12);
 
+  // Homing 狀態
   if (g_systemState == HOMING) {
-    display.setTextSize(2);
-    display.setCursor(10, 20);
-    display.print(F("HOMING"));
+    u8g2.setCursor(20, 30);
+    u8g2.print("歸位中");
 
-    display.setTextSize(1);
-    display.setCursor(10, 40);
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.setCursor(30, 45);
 
     switch(g_homing.phase) {
       case NOT_STARTED:
-        display.print(F("Waiting..."));
+        u8g2.print("Waiting...");
         break;
       case MOVING:
         {
           unsigned long elapsed = millis() - g_homing.startTime;
-          display.print(F("Moving "));
-          display.print(elapsed / 1000);
-          display.print(F("s"));
+          u8g2.print("Moving ");
+          u8g2.print(elapsed / 1000);
+          u8g2.print("s");
         }
         break;
       case COMPLETED:
-        display.print(F("Completed!"));
+        u8g2.print("Completed!");
         break;
       case FAILED:
-        display.print(F("FAILED!"));
+        u8g2.print("FAILED!");
         break;
     }
 
-    display.display();
+    u8g2.sendBuffer();
     return;
   }
 
-  display.setTextSize(2);
-  display.setCursor(0, 12);
+  // 系統狀態
+  u8g2.setCursor(0, 28);
   switch(g_systemState) {
-    case AT_TOP: display.print(F("AT TOP")); break;
-    case AT_BOTTOM: display.print(F("AT BTM")); break;
-    case MOVING_UP: display.print(F("UP")); break;
-    case MOVING_DOWN: display.print(F("DOWN")); break;
+    case AT_TOP: u8g2.print("位於上限"); break;
+    case AT_BOTTOM: u8g2.print("位於下限"); break;
+    case MOVING_UP: u8g2.print("上升中"); break;
+    case MOVING_DOWN: u8g2.print("下降中"); break;
     default: break;
   }
 
-  display.drawLine(0, 28, 127, 28, SSD1306_WHITE);
+  u8g2.drawLine(0, 30, 127, 30);
 
-  display.setTextSize(1);
-  display.setCursor(0, 31);
-  display.print(F("Speed:"));
-  display.setTextSize(2);
-  display.setCursor(0, 40);
-  display.print((int)g_speed.currentSpeed);
-  display.setTextSize(1);
-  display.setCursor(30, 44);
-  display.print(F("km/h"));
+  // 速度和角度
+  u8g2.setFont(u8g2_font_6x10_tr);
 
-  display.setCursor(70, 31);
-  display.print(F("Angle:"));
-  display.setTextSize(2);
-  display.setCursor(70, 40);
-  display.print((int)g_imu.tiltAngle);
-  display.setTextSize(1);
-  display.setCursor(100, 44);
-  display.print(F("o"));
+  u8g2.setCursor(0, 42);
+  u8g2.print("Speed:");
+  u8g2.setFont(u8g2_font_10x20_tr);
+  u8g2.setCursor(40, 45);
+  u8g2.print((int)g_speed.currentSpeed);
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.setCursor(70, 42);
+  u8g2.print("km/h");
 
-  display.drawLine(0, 52, 127, 52, SSD1306_WHITE);
-  display.setCursor(0, 54);
-  display.print(F("Motor:"));
-  display.print(g_motor.isRunning() ? F("ON") : F("OFF"));
+  u8g2.setCursor(0, 56);
+  u8g2.print("Angle:");
+  u8g2.setFont(u8g2_font_10x20_tr);
+  u8g2.setCursor(40, 59);
+  u8g2.print((int)g_imu.tiltAngle);
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.setCursor(70, 56);
+  u8g2.print("deg");
 
-  display.display();
+  // PWM
+  u8g2.setCursor(90, 56);
+  u8g2.print("P:");
+  u8g2.print(g_motor.currentPWM);
+
+  u8g2.sendBuffer();
 }
 
 void drawDebugPage() {
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_unifont_t_chinese1);
 
-  display.setCursor(0, 0);
-  display.print(F("DEBUG v9.7"));
-  display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
+  u8g2.setCursor(0, 10);
+  u8g2.print("除錯資訊");
+  u8g2.drawLine(0, 12, 127, 12);
 
-  display.setCursor(0, 12);
-  display.print(F("State: "));
-  display.print(g_systemState);
+  u8g2.setFont(u8g2_font_6x10_tr);
 
-  display.setCursor(0, 22);
-  display.print(F("Homing: "));
-  display.print(g_homing.phase);
+  // 第一行：State 和 Lock
+  u8g2.setCursor(0, 22);
+  u8g2.print("State:");
+  u8g2.print(g_systemState);
 
-  display.setCursor(0, 32);
-  display.print(F("Motor: "));
-  display.print(g_motor.isRunning() ? F("ON") : F("OFF"));
+  u8g2.setCursor(70, 22);
+  u8g2.print("Lock:");
+  u8g2.print(g_systemLock.locked ? "Y" : "N");
 
-  display.setCursor(0, 42);
-  display.print(F("Lock: "));
-  display.print(g_systemLock.locked ? F("Y") : F("N"));
+  // 第二行：Homing 和 IMU
+  u8g2.setCursor(0, 32);
+  u8g2.print("Homing:");
+  u8g2.print(g_homing.phase);
 
-  display.setCursor(0, 52);
-  display.print(F("IMU err: "));
-  display.print(g_imu.consecutiveReadFailures);
+  u8g2.setCursor(70, 32);
+  u8g2.print("IMU:");
+  u8g2.print(g_imu.consecutiveReadFailures);
 
-  display.display();
+  // 第三行：PWM 和 Man
+  u8g2.setCursor(0, 42);
+  u8g2.print("PWM:");
+  u8g2.print(g_motor.currentPWM);
+
+  u8g2.setCursor(70, 42);
+  u8g2.print("Man:");
+  u8g2.print(g_motor.manualOverride ? "Y" : "N");
+
+  // 第四行：限位開關狀態（新增！）
+  u8g2.drawLine(0, 44, 127, 44);
+  u8g2.setCursor(0, 54);
+  u8g2.print("Limit UP:");
+  u8g2.print(g_limits.upperTriggered ? "ON" : "off");
+
+  u8g2.setCursor(70, 54);
+  u8g2.print("DN:");
+  u8g2.print(g_limits.lowerTriggered ? "ON" : "off");
+
+  // 第五行：原始限位狀態（即時讀取）
+  u8g2.setCursor(0, 63);
+  bool upperRaw = (digitalRead(Pins::LIMIT_UP) == LOW);
+  bool lowerRaw = (digitalRead(Pins::LIMIT_DOWN) == LOW);
+  u8g2.print("Raw U:");
+  u8g2.print(upperRaw ? "1" : "0");
+  u8g2.setCursor(70, 63);
+  u8g2.print("D:");
+  u8g2.print(lowerRaw ? "1" : "0");
+
+  u8g2.sendBuffer();
 }
 
 // ============================================================================
 // Setup
 // ============================================================================
 void initializePins() {
-  pinMode(Pins::RELAY_PIN, OUTPUT);
+  pinMode(Pins::PWM, OUTPUT);
   pinMode(Pins::LIMIT_UP, INPUT_PULLUP);
   pinMode(Pins::LIMIT_DOWN, INPUT_PULLUP);
   pinMode(Pins::HALL_SPEED, INPUT_PULLUP);
@@ -1014,35 +1088,36 @@ void initializePins() {
   pinMode(Pins::RGB_GREEN, OUTPUT);
   pinMode(Pins::RGB_BLUE, OUTPUT);
   pinMode(Pins::BUZZER, OUTPUT);
-  
-  digitalWrite(Pins::RELAY_PIN, RelayControl::MOTOR_OFF);
+
+  analogWrite(Pins::PWM, PWMControl::STOPPED);
   Serial.println(F("[初始化] 所有腳位已設定"));
 }
 
 void initializeDisplay() {
-  if(!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
-    Serial.println(F("[錯誤] OLED 初始化失敗"));
-    while(1);
-  }
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println(F("System v9.7"));
-  display.display();
-  Serial.println(F("[初始化] OLED 已啟動"));
+  u8g2.begin();
+  u8g2.enableUTF8Print();  // 啟用 UTF-8 支援！
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_unifont_t_chinese1);
+  u8g2.setCursor(0, 20);
+  u8g2.print("腳踏車系統");
+  u8g2.setCursor(0, 40);
+  u8g2.print("版本 9.7");
+  u8g2.sendBuffer();
+
+  Serial.println(F("[初始化] OLED 已啟動 (中文模式)"));
 }
 
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000);
-  
+
   Serial.println(F("\n========================================"));
-  Serial.println(F("輔助輪系統 v9.7 啟動 (繼電器版-修正)"));
+  Serial.println(F("輔助輪系統 v9.7 啟動（中文版）"));
   Serial.println(F("========================================"));
 
   initializePins();
-  
+
   Wire.begin();
   Wire.setClock(400000);
   Serial.println(F("[初始化] I2C 已啟動"));
@@ -1121,8 +1196,8 @@ void printStatusIfNeeded() {
     g_lastStatusPrint = millis();
     Serial.print(F("[狀態] State:"));
     Serial.print(g_systemState);
-    Serial.print(F(" Motor:"));
-    Serial.print(g_motor.isRunning() ? F("ON") : F("OFF"));
+    Serial.print(F(" PWM:"));
+    Serial.print(g_motor.currentPWM);
     Serial.print(F(" Speed:"));
     Serial.print(g_speed.currentSpeed, 1);
     Serial.print(F(" Tilt:"));
