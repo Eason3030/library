@@ -87,7 +87,7 @@ namespace Speed {
 // IMU 相關常數
 namespace IMU {
   const float ACCEL_SCALE = 16384.0;
-  const float RAD_TO_DEG = 57.2958;
+  const float RAD_TO_DEG_CONV = 57.2958;  // 避免與 Arduino.h 的 RAD_TO_DEG 衝突
   const float TILT_WARNING_DEGREES = 10.0;
   const float TILT_DANGER_DEGREES = 15.0;
   const int MAX_READ_FAILURES = 5;
@@ -122,9 +122,9 @@ enum HomingPhase : byte {
 };
 
 enum HomingFailureReason : byte {
-  UNKNOWN = 0,
-  TIMEOUT = 1,
-  LIMIT_SWITCH_ERROR = 2
+  HOMING_UNKNOWN = 0,          // 避免與 IRremote 的 UNKNOWN 衝突
+  HOMING_TIMEOUT = 1,
+  HOMING_LIMIT_SWITCH_ERROR = 2
 };
 
 // ============================================================================
@@ -135,13 +135,13 @@ struct HomingState {
   HomingPhase phase = NOT_STARTED;
   unsigned long startTime = 0;
   bool enabled = true;
-  HomingFailureReason failureReason = UNKNOWN;
+  HomingFailureReason failureReason = HOMING_UNKNOWN;
 
   void reset() {
     phase = NOT_STARTED;
     startTime = 0;
     enabled = true;
-    failureReason = UNKNOWN;
+    failureReason = HOMING_UNKNOWN;
   }
 };
 
@@ -471,7 +471,7 @@ bool readIMUData(int16_t& accelX, int16_t& accelY, int16_t& accelZ) {
 float calculateTiltAngle(int16_t accelX, int16_t accelZ) {
   float ax = accelX / IMU::ACCEL_SCALE;
   float az = accelZ / IMU::ACCEL_SCALE;
-  float angle = atan2(ax, az) * IMU::RAD_TO_DEG;
+  float angle = atan2(ax, az) * IMU::RAD_TO_DEG_CONV;
   return constrain(angle, -90.0, 90.0);
 }
 
@@ -593,7 +593,7 @@ void handleBothLimitsSwitchesTriggered() {
 
   if (g_homing.phase == MOVING) {
     g_homing.phase = FAILED;
-    g_homing.failureReason = LIMIT_SWITCH_ERROR;
+    g_homing.failureReason = HOMING_LIMIT_SWITCH_ERROR;
   }
 
   Serial.println(F("[錯誤] 兩個限位同時觸發！"));
@@ -663,7 +663,7 @@ void startHomingSequence() {
 
   if (upperNow && lowerNow) {
     g_homing.phase = FAILED;
-    g_homing.failureReason = LIMIT_SWITCH_ERROR;
+    g_homing.failureReason = HOMING_LIMIT_SWITCH_ERROR;
     g_systemState = AT_BOTTOM;
     Serial.println(F("[Homing] 失敗 - 限位開關異常"));
     playWarning();
@@ -696,7 +696,7 @@ void checkHomingTimeout() {
   if (elapsedTime > Timing::HOMING_TIMEOUT_MS) {
     g_motor.setTarget(PWMControl::STOPPED);
     g_homing.phase = FAILED;
-    g_homing.failureReason = TIMEOUT;
+    g_homing.failureReason = HOMING_TIMEOUT;
     g_systemState = AT_BOTTOM;
     Serial.println(F("[Homing] 失敗 - 逾時未觸發限位"));
     Serial.println(F("  可能原因: 機構卡住/限位開關故障"));
