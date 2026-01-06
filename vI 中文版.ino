@@ -6,6 +6,8 @@
 // 3. ✓ 優化版面配置適應中文字型
 // 4. ✓ 保留所有原有功能
 // ============================================================================
+#include <Arduino.h>
+#include <stdint.h>
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <IRremote.h>
