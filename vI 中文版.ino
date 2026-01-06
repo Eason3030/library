@@ -819,12 +819,35 @@ void toggleManualOverride() {
   g_motor.manualOverride = !g_motor.manualOverride;
 
   if (g_motor.manualOverride) {
-    g_motor.setTarget(PWMControl::STOPPED);
     playTone(NOTE_C4, 200);
-    Serial.println(F("[紅外] PWM 手動關閉 (安全模式)"));
+    Serial.println(F("[紅外] 進入手動模式"));
+
+    // 手動模式：根據當前狀態決定動作
+    if (g_systemState == AT_BOTTOM || g_systemState == MOVING_DOWN) {
+      // 在下限或下降中 → 切換為上升
+      if (!g_limits.upperTriggered) {
+        g_motor.setTarget(g_motor.normalSpeed);
+        g_systemState = MOVING_UP;
+        Serial.println(F("[手動] 啟動上升"));
+      } else {
+        Serial.println(F("[手動] 已在上限，無法上升"));
+        g_motor.setTarget(PWMControl::STOPPED);
+      }
+    } else if (g_systemState == AT_TOP || g_systemState == MOVING_UP) {
+      // 在上限或上升中 → 切換為下降
+      if (!g_limits.lowerTriggered) {
+        g_motor.setTarget(g_motor.normalSpeed);
+        g_systemState = MOVING_DOWN;
+        Serial.println(F("[手動] 啟動下降"));
+      } else {
+        Serial.println(F("[手動] 已在下限，無法下降"));
+        g_motor.setTarget(PWMControl::STOPPED);
+      }
+    }
   } else {
     playTone(NOTE_C5, 200);
-    Serial.println(F("[紅外] PWM 自動模式恢復"));
+    Serial.println(F("[紅外] 退出手動模式，恢復自動"));
+    g_motor.setTarget(PWMControl::STOPPED);
   }
 }
 
@@ -852,7 +875,8 @@ void executeMotorControl() {
   } else if (g_systemState == HOMING) {
     g_motor.setTarget(PWMControl::STOPPED);
   } else if (g_motor.manualOverride) {
-    g_motor.setTarget(PWMControl::STOPPED);
+    // 手動模式：維持當前 target，不自動停止
+    // PWM 已在 toggleManualOverride() 中設定
   } else if (g_systemState == AT_TOP || g_systemState == AT_BOTTOM) {
     g_motor.setTarget(PWMControl::STOPPED);
   } else if (g_systemState == MOVING_UP || g_systemState == MOVING_DOWN) {
@@ -865,6 +889,22 @@ void executeMotorControl() {
     if (g_limits.lowerTriggered && g_systemState == MOVING_DOWN) {
       g_motor.setTarget(PWMControl::STOPPED);
       g_systemState = AT_BOTTOM;
+    }
+  }
+
+  // 即使在手動模式，也要檢查限位開關
+  if (g_motor.manualOverride) {
+    if (g_limits.upperTriggered && g_systemState == MOVING_UP) {
+      g_motor.setTarget(PWMControl::STOPPED);
+      g_systemState = AT_TOP;
+      g_motor.manualOverride = false;  // 到達限位，自動退出手動模式
+      Serial.println(F("[手動] 到達上限，自動停止"));
+    }
+    if (g_limits.lowerTriggered && g_systemState == MOVING_DOWN) {
+      g_motor.setTarget(PWMControl::STOPPED);
+      g_systemState = AT_BOTTOM;
+      g_motor.manualOverride = false;  // 到達限位，自動退出手動模式
+      Serial.println(F("[手動] 到達下限，自動停止"));
     }
   }
 
@@ -985,29 +1025,52 @@ void drawDebugPage() {
 
   u8g2.setFont(u8g2_font_6x10_tr);
 
-  u8g2.setCursor(0, 24);
-  u8g2.print("State: ");
+  // 第一行：State 和 Lock
+  u8g2.setCursor(0, 22);
+  u8g2.print("State:");
   u8g2.print(g_systemState);
 
-  u8g2.setCursor(0, 36);
-  u8g2.print("Homing: ");
-  u8g2.print(g_homing.phase);
-
-  u8g2.setCursor(0, 48);
-  u8g2.print("PWM: ");
-  u8g2.print(g_motor.currentPWM);
-
-  u8g2.setCursor(70, 24);
+  u8g2.setCursor(70, 22);
   u8g2.print("Lock:");
   u8g2.print(g_systemLock.locked ? "Y" : "N");
 
-  u8g2.setCursor(70, 36);
+  // 第二行：Homing 和 IMU
+  u8g2.setCursor(0, 32);
+  u8g2.print("Homing:");
+  u8g2.print(g_homing.phase);
+
+  u8g2.setCursor(70, 32);
   u8g2.print("IMU:");
   u8g2.print(g_imu.consecutiveReadFailures);
 
-  u8g2.setCursor(70, 48);
+  // 第三行：PWM 和 Man
+  u8g2.setCursor(0, 42);
+  u8g2.print("PWM:");
+  u8g2.print(g_motor.currentPWM);
+
+  u8g2.setCursor(70, 42);
   u8g2.print("Man:");
   u8g2.print(g_motor.manualOverride ? "Y" : "N");
+
+  // 第四行：限位開關狀態（新增！）
+  u8g2.drawLine(0, 44, 127, 44);
+  u8g2.setCursor(0, 54);
+  u8g2.print("Limit UP:");
+  u8g2.print(g_limits.upperTriggered ? "ON" : "off");
+
+  u8g2.setCursor(70, 54);
+  u8g2.print("DN:");
+  u8g2.print(g_limits.lowerTriggered ? "ON" : "off");
+
+  // 第五行：原始限位狀態（即時讀取）
+  u8g2.setCursor(0, 63);
+  bool upperRaw = (digitalRead(Pins::LIMIT_UP) == LOW);
+  bool lowerRaw = (digitalRead(Pins::LIMIT_DOWN) == LOW);
+  u8g2.print("Raw U:");
+  u8g2.print(upperRaw ? "1" : "0");
+  u8g2.setCursor(70, 63);
+  u8g2.print("D:");
+  u8g2.print(lowerRaw ? "1" : "0");
 
   u8g2.sendBuffer();
 }
