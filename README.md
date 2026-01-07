@@ -102,58 +102,94 @@
 
 ### 7. 系統流程圖
 ```mermaid
-graph TD
-    Start([系統啟動]) --> Init[初始化設定<br/>輔助輪下降]
-    Init --> InitHW[硬體初始化<br/>I2C, GPIO, OLED, MPU6050, INA226, 磁簧開關]
-    InitHW --> Calib[IMU 校正<br/>陀螺儀零點偏移]
-    Calib --> StartAnim[開機動畫]
-    StartAnim --> StartSound[啟動音效]
-    StartSound --> MainLoop{主迴圈}
-
-    MainLoop --> ReadSensors[讀取感測器<br/>IMU, 電流, 速度, 磁簧開關]
-    ReadSensors --> UpdateHistory[更新歷史數據<br/>速度/角度]
-    UpdateHistory --> CheckIR{紅外線接收?}
-    CheckIR -->|Yes| HandleIR[處理紅外線<br/>手動模式]
-    CheckIR -->|No| CheckLimit
-
-    CheckLimit{磁簧開關觸發?}
-    CheckLimit -->|上限位| LimitUp[鎖定輔助輪上升]
-    CheckLimit -->|下限位| LimitDown[鎖定輔助輪下降]
-    CheckLimit -->|無觸發| CheckEmergency
-    LimitUp --> CheckEmergency
-    LimitDown --> CheckEmergency
-
-    CheckEmergency{緊急停止?}
-    CheckEmergency -->|是| EmergencyStop[冷卻模式<br/>停止馬達<br/>紅燈警報]
-    CheckEmergency -->|否| CheckState
-
-    CheckState{系統狀態}
-    CheckState -->|RUNNING| RunningState[運行模式]
-    CheckState -->|COOLING_DOWN| CoolingState[冷卻模式]
-
-    RunningState --> TiltProtect{傾斜保護}
-    TiltProtect -->|>35°| EmergencyTilt[緊急傾斜<br/>紅燈警報]
-    TiltProtect -->|20~35°| TiltWarn{>0.5秒?}
-    TiltProtect -->|<20°| TiltNormal
-
-    TiltWarn -->|是| ActivateWarn[傾斜警告<br/>輔助輪下降<br/>藍燈]
-    TiltWarn -->|否| CheckSpeed
-    ActivateWarn --> TiltRecoverCheck{<12°? 持續3秒}
-    TiltRecoverCheck -->|是| TiltRecover[解除警告<br/>輔助輪上升<br/>綠燈]
-    TiltRecoverCheck -->|否| MaintainWarn[保持警告]
-    TiltRecover --> CheckSpeed
-    MaintainWarn --> CheckSpeed
-    TiltNormal --> CheckSpeed
-
-    CheckSpeed{速度控制<br/>非手動/警告}
-    CheckSpeed -->|<10 km/h 且未到下限| AutoDown[自動下降輔助輪<br/>黃燈]
-    CheckSpeed -->|≥10 km/h 且未到上限| AutoUp[自動上升輔助輪<br/>綠燈]
-    CheckSpeed -->|保持現狀| KeepStatus
-
-    AutoDown --> ExecuteControl
-    AutoUp --> ExecuteControl
-    KeepStatus --> ExecuteControl
-
-    ExecuteControl[執行 PWM 控制<br/>上下移動<br/>檢查磁簧開關]
-    ExecuteControl --> UpdateDisplay[更新 OLED<br/>顯示狀態/速度/角度]
-    UpdateDisplay --> MainLoop
+flowchart TD
+    Start([系統上電]) --> Init[初始化腳位和元件]
+    Init --> CalibStart[開始初始化校正]
+    CalibStart --> StateInit{狀態 = INIT}
+    
+    StateInit --> RelayOn[繼電器 ON<br/>馬達開始旋轉]
+    RelayOn --> CheckUpper{檢查上磁簧}
+    
+    CheckUpper -->|觸發| LogUpper[記錄：上磁簧已通過<br/>upperPassed = true]
+    CheckUpper -->|未觸發| CheckLower{檢查下磁簧}
+    LogUpper --> CheckLower
+    
+    CheckLower -->|觸發| InitStop[繼電器 OFF<br/>播放完成音效]
+    CheckLower -->|未觸發| CheckTimeout1{超時 10 秒?}
+    
+    CheckTimeout1 -->|是| ErrorState1[進入 ERROR 狀態]
+    CheckTimeout1 -->|否| CheckUpper
+    
+    InitStop --> CheckInitResult{上磁簧<br/>是否通過?}
+    CheckInitResult -->|是| InitOK[✓ 初始化完整<br/>機構正常]
+    CheckInitResult -->|否| InitWarn[⚠️ 未經過上磁簧<br/>可能已在下方]
+    
+    InitOK --> IdleState[/狀態 = IDLE/]
+    InitWarn --> IdleState
+    
+    IdleState --> RelayOff[繼電器 OFF<br/>馬達斷電]
+    RelayOff --> Monitor{監測系統}
+    
+    Monitor --> CheckTilt{傾角 > 15°?}
+    CheckTilt -->|是| Beep[蜂鳴器警告]
+    CheckTilt -->|否| CheckIR{接收到 IR?}
+    Beep --> CheckIR
+    
+    CheckIR -->|IR_DOWN| StartLower[啟動下降流程]
+    CheckIR -->|IR_UP| StartRaise[啟動上升流程]
+    CheckIR -->|無| CheckSpeed{速度濾波<br/>≥ 15 km/h?}
+    
+    CheckSpeed -->|是| StartRaise
+    CheckSpeed -->|否| CheckButton{按鈕按下?}
+    
+    CheckButton -->|是| NextPage[OLED 翻頁]
+    CheckButton -->|否| Monitor
+    NextPage --> Monitor
+    
+    StartLower --> StateLower{狀態 = IDLE?}
+    StateLower -->|否| Monitor
+    StateLower -->|是| LowerState[/狀態 = LOWERING/]
+    
+    LowerState --> LowerRelay[繼電器 ON<br/>開始計時]
+    LowerRelay --> CheckLowerSwitch{下磁簧觸發?<br/>連續 3 次確認}
+    
+    CheckLowerSwitch -->|是| LowerStop[繼電器 OFF<br/>下降完成音效]
+    CheckLowerSwitch -->|否| CheckTimeout2{超時 10 秒?}
+    
+    CheckTimeout2 -->|是| ErrorState2[進入 ERROR 狀態]
+    CheckTimeout2 -->|否| CheckLowerSwitch
+    
+    LowerStop --> IdleState
+    
+    StartRaise --> StateRaise{狀態 = IDLE?}
+    StateRaise -->|否| Monitor
+    StateRaise -->|是| RaiseState[/狀態 = RAISING/]
+    
+    RaiseState --> RaiseRelay[繼電器 ON<br/>開始計時]
+    RaiseRelay --> CheckUpperSwitch{上磁簧觸發?<br/>連續 3 次確認}
+    
+    CheckUpperSwitch -->|是| RaiseStop[繼電器 OFF<br/>上升完成音效]
+    CheckUpperSwitch -->|否| CheckTimeout3{超時 10 秒?}
+    
+    CheckTimeout3 -->|是| ErrorState3[進入 ERROR 狀態]
+    CheckTimeout3 -->|否| CheckUpperSwitch
+    
+    RaiseStop --> IdleState
+    
+    ErrorState1 --> ErrorDisplay[顯示錯誤訊息<br/>繼電器強制 OFF]
+    ErrorState2 --> ErrorDisplay
+    ErrorState3 --> ErrorDisplay
+    
+    ErrorDisplay --> LongPress{長按按鈕<br/>3 秒?}
+    LongPress -->|是| ManualReset[手動重啟系統<br/>播放提示音]
+    LongPress -->|否| ErrorDisplay
+    
+    ManualReset --> CalibStart
+    
+    style Start fill:#90EE90
+    style IdleState fill:#87CEEB
+    style LowerState fill:#FFD700
+    style RaiseState fill:#FFD700
+    style ErrorDisplay fill:#FF6B6B
+    style InitOK fill:#90EE90
+    style InitWarn fill:#FFA500
