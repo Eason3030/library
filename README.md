@@ -102,94 +102,548 @@
 
 ### 7. 系統流程圖
 ```mermaid
+# 輔助輪控制系統 v10.1 - 完整流程圖
+
+## 1. 系統整體狀態機
+
+```mermaid
+stateDiagram-v2
+    [*] --> 上電啟動
+    
+    上電啟動 --> 檢查測試模式: 讀取按鈕
+    
+    檢查測試模式 --> INIT: 按鈕未按下
+    檢查測試模式 --> TEST_MODE: 按鈕按住
+    
+    INIT --> 初始化流程
+    
+    初始化流程 --> IDLE: 初始化成功
+    初始化流程 --> ERROR: 初始化失敗
+    
+    IDLE --> MOVING_UP: IR指令/自動觸發
+    IDLE --> MOVING_DOWN: IR指令
+    
+    MOVING_UP --> IDLE: 到達上限位
+    MOVING_UP --> ERROR: 超時10秒
+    MOVING_UP --> MOVING_DOWN: IR中途切換
+    
+    MOVING_DOWN --> IDLE: 到達下限位
+    MOVING_DOWN --> ERROR: 超時10秒
+    MOVING_DOWN --> MOVING_UP: IR中途切換
+    
+    TEST_MODE --> MOVING_UP: IR指令
+    TEST_MODE --> MOVING_DOWN: IR指令
+    
+    MOVING_UP --> TEST_MODE: 測試模式到達限位
+    MOVING_DOWN --> TEST_MODE: 測試模式到達限位
+    
+    ERROR --> [*]: 需重啟系統
+    
+    note right of IDLE
+        RGB: 青色
+        繼電器: 關閉
+        等待指令
+    end note
+    
+    note right of MOVING_UP
+        RGB: 綠色
+        繼電器: 開啟
+        監測上限位
+    end note
+    
+    note right of MOVING_DOWN
+        RGB: 紅色
+        繼電器: 開啟
+        監測下限位
+    end note
+    
+    note right of ERROR
+        RGB: 紅色閃爍
+        繼電器: 關閉
+        系統鎖定
+    end note
+```
+
+## 2. 初始化流程詳細圖
+
+```mermaid
 flowchart TD
-    Start([系統上電]) --> Init[初始化腳位和元件]
-    Init --> CalibStart[開始初始化校正]
-    CalibStart --> StateInit{狀態 = INIT}
+    Start([系統啟動]) --> CheckButton{檢查按鈕<br/>是否按住?}
     
-    StateInit --> RelayOn[繼電器 ON<br/>馬達開始旋轉]
-    RelayOn --> CheckUpper{檢查上磁簧}
+    CheckButton -->|是| TestMode[進入測試模式<br/>跳過初始化]
+    CheckButton -->|否| InitStart[INIT_START<br/>準備初始化]
     
-    CheckUpper -->|觸發| LogUpper[記錄：上磁簧已通過<br/>upperPassed = true]
-    CheckUpper -->|未觸發| CheckLower{檢查下磁簧}
-    LogUpper --> CheckLower
+    InitStart --> ReadSwitch[讀取磁簧狀態]
+    ReadSwitch --> TurnOnRelay[開啟繼電器<br/>啟動馬達]
+    TurnOnRelay --> StartTimer[啟動超時計時器<br/>10秒]
+    StartTimer --> Searching[INIT_SEARCHING<br/>搜尋上限位]
     
-    CheckLower -->|觸發| InitStop[繼電器 OFF<br/>播放完成音效]
-    CheckLower -->|未觸發| CheckTimeout1{超時 10 秒?}
+    Searching --> CheckLower1{檢查下限位<br/>是否觸發?}
+    CheckLower1 -->|是| AlreadyDown[已在下限位]
+    AlreadyDown --> StopRelay1[關閉繼電器]
+    StopRelay1 --> Complete1[初始化完成<br/>→ IDLE]
     
-    CheckTimeout1 -->|是| ErrorState1[進入 ERROR 狀態]
-    CheckTimeout1 -->|否| CheckUpper
+    CheckLower1 -->|否| CheckUpper{檢查上限位<br/>是否觸發?}
+    CheckUpper -->|否| CheckTimeout1{是否超時?}
+    CheckTimeout1 -->|是| Failed1[初始化失敗<br/>→ ERROR]
+    CheckTimeout1 -->|否| Searching
     
-    InitStop --> CheckInitResult{上磁簧<br/>是否通過?}
-    CheckInitResult -->|是| InitOK[✓ 初始化完整<br/>機構正常]
-    CheckInitResult -->|否| InitWarn[⚠️ 未經過上磁簧<br/>可能已在下方]
+    CheckUpper -->|是| UpperFound[找到上限位<br/>記錄事件]
+    UpperFound --> MovingToLower[INIT_MOVING_TO_LOWER<br/>繼續移動至下限]
     
-    InitOK --> IdleState[/狀態 = IDLE/]
-    InitWarn --> IdleState
+    MovingToLower --> CheckLower2{檢查下限位<br/>是否觸發?}
+    CheckLower2 -->|是| ReachLower[到達下限位]
+    ReachLower --> StopRelay2[關閉繼電器]
+    StopRelay2 --> Delay[等待500ms<br/>穩定]
+    Delay --> Complete2[初始化完成<br/>→ IDLE]
     
-    IdleState --> RelayOff[繼電器 OFF<br/>馬達斷電]
-    RelayOff --> Monitor{監測系統}
+    CheckLower2 -->|否| CheckTimeout2{是否超時?}
+    CheckTimeout2 -->|是| Failed2[初始化失敗<br/>→ ERROR]
+    CheckTimeout2 -->|否| MovingToLower
     
-    Monitor --> CheckTilt{傾角 > 15°?}
-    CheckTilt -->|是| Beep[蜂鳴器警告]
-    CheckTilt -->|否| CheckIR{接收到 IR?}
-    Beep --> CheckIR
+    Complete1 --> PlaySound1[播放完成音效]
+    Complete2 --> PlaySound2[播放完成音效]
+    Failed1 --> PlayError1[播放錯誤音效]
+    Failed2 --> PlayError2[播放錯誤音效]
     
-    CheckIR -->|IR_DOWN| StartLower[啟動下降流程]
-    CheckIR -->|IR_UP| StartRaise[啟動上升流程]
-    CheckIR -->|無| CheckSpeed{速度濾波<br/>≥ 15 km/h?}
+    PlaySound1 --> End([進入待機狀態])
+    PlaySound2 --> End
+    PlayError1 --> ErrorState([進入錯誤狀態])
+    PlayError2 --> ErrorState
     
-    CheckSpeed -->|是| StartRaise
-    CheckSpeed -->|否| CheckButton{按鈕按下?}
+    TestMode --> TestEnd([測試模式待機])
     
-    CheckButton -->|是| NextPage[OLED 翻頁]
-    CheckButton -->|否| Monitor
-    NextPage --> Monitor
+    style Start fill:#e1f5ff
+    style End fill:#c8e6c9
+    style ErrorState fill:#ffcdd2
+    style TestEnd fill:#fff9c4
+    style TurnOnRelay fill:#ffe0b2
+    style StopRelay1 fill:#ffe0b2
+    style StopRelay2 fill:#ffe0b2
+```
+
+## 3. IR 控制流程
+
+```mermaid
+flowchart TD
+    IRStart([接收到IR信號]) --> DecodeIR[解碼IR數據]
     
-    StartLower --> StateLower{狀態 = IDLE?}
-    StateLower -->|否| Monitor
-    StateLower -->|是| LowerState[/狀態 = LOWERING/]
+    DecodeIR --> CheckNull{代碼是否<br/>為 0x0000?}
+    CheckNull -->|是| IgnoreNull[忽略: 空碼]
+    CheckNull -->|否| CheckRepeat{代碼是否<br/>為 0xFFFF?}
     
-    LowerState --> LowerRelay[繼電器 ON<br/>開始計時]
-    LowerRelay --> CheckLowerSwitch{下磁簧觸發?<br/>連續 3 次確認}
+    CheckRepeat -->|是| IgnoreRepeat[忽略: 重複碼]
+    CheckRepeat -->|否| CheckDebounce{距上次按下<br/>是否 < 800ms?}
     
-    CheckLowerSwitch -->|是| LowerStop[繼電器 OFF<br/>下降完成音效]
-    CheckLowerSwitch -->|否| CheckTimeout2{超時 10 秒?}
+    CheckDebounce -->|是| IgnoreDebounce[忽略: 防彈跳]
+    CheckDebounce -->|否| ValidSignal[有效信號<br/>記錄時間]
     
-    CheckTimeout2 -->|是| ErrorState2[進入 ERROR 狀態]
-    CheckTimeout2 -->|否| CheckLowerSwitch
+    ValidSignal --> CheckState{檢查當前狀態}
     
-    LowerStop --> IdleState
+    CheckState -->|INIT| ActionInit[提示音<br/>忽略指令]
+    CheckState -->|ERROR| ActionError[錯誤音<br/>需重啟]
+    CheckState -->|IDLE/TEST| CheckPosition{檢查磁簧位置}
+    CheckState -->|MOVING_UP| ActionReverse1[停止上升<br/>切換下降]
+    CheckState -->|MOVING_DOWN| ActionReverse2[停止下降<br/>切換上升]
     
-    StartRaise --> StateRaise{狀態 = IDLE?}
-    StateRaise -->|否| Monitor
-    StateRaise -->|是| RaiseState[/狀態 = RAISING/]
+    CheckPosition -->|在下限位| ActionUp[啟動上升]
+    CheckPosition -->|在上限位| ActionDown[啟動下降]
+    CheckPosition -->|在中間| ActionDefault[預設下降]
+    CheckPosition -->|兩限位同時觸發| ActionStop[停止<br/>異常狀態]
     
-    RaiseState --> RaiseRelay[繼電器 ON<br/>開始計時]
-    RaiseRelay --> CheckUpperSwitch{上磁簧觸發?<br/>連續 3 次確認}
+    ActionUp --> ExecuteUp[執行上升動作]
+    ActionDown --> ExecuteDown[執行下降動作]
+    ActionDefault --> ExecuteDown
+    ActionReverse1 --> ExecuteDown
+    ActionReverse2 --> ExecuteUp
     
-    CheckUpperSwitch -->|是| RaiseStop[繼電器 OFF<br/>上升完成音效]
-    CheckUpperSwitch -->|否| CheckTimeout3{超時 10 秒?}
+    ExecuteUp --> EndProcess([IR處理完成])
+    ExecuteDown --> EndProcess
+    ActionInit --> EndProcess
+    ActionError --> EndProcess
+    ActionStop --> EndProcess
     
-    CheckTimeout3 -->|是| ErrorState3[進入 ERROR 狀態]
-    CheckTimeout3 -->|否| CheckUpperSwitch
+    IgnoreNull --> EndProcess
+    IgnoreRepeat --> EndProcess
+    IgnoreDebounce --> EndProcess
     
-    RaiseStop --> IdleState
+    style ValidSignal fill:#c8e6c9
+    style IgnoreNull fill:#ffcdd2
+    style IgnoreRepeat fill:#ffcdd2
+    style IgnoreDebounce fill:#ffcdd2
+    style ExecuteUp fill:#a5d6a7
+    style ExecuteDown fill:#ef9a9a
+```
+
+## 4. 上升動作流程
+
+```mermaid
+flowchart TD
+    Start([啟動上升指令]) --> CheckState{檢查狀態<br/>是否為IDLE?}
     
-    ErrorState1 --> ErrorDisplay[顯示錯誤訊息<br/>繼電器強制 OFF]
-    ErrorState2 --> ErrorDisplay
-    ErrorState3 --> ErrorDisplay
+    CheckState -->|否| Reject[拒絕執行<br/>非待機狀態]
+    CheckState -->|是| LogStart[記錄日誌<br/>上升啟動]
     
-    ErrorDisplay --> LongPress{長按按鈕<br/>3 秒?}
-    LongPress -->|是| ManualReset[手動重啟系統<br/>播放提示音]
-    LongPress -->|否| ErrorDisplay
+    LogStart --> SetState[設定狀態<br/>→ MOVING_UP]
+    SetState --> TurnOnRelay[開啟繼電器]
+    TurnOnRelay --> StartTimer[啟動計時器]
+    StartTimer --> PlaySound[播放上升音效]
+    PlaySound --> LoopStart[進入上升循環]
     
-    ManualReset --> CalibStart
+    LoopStart --> CheckUpper{檢查上限位<br/>是否觸發?}
     
-    style Start fill:#90EE90
-    style IdleState fill:#87CEEB
-    style LowerState fill:#FFD700
-    style RaiseState fill:#FFD700
-    style ErrorDisplay fill:#FF6B6B
-    style InitOK fill:#90EE90
-    style InitWarn fill:#FFA500
+    CheckUpper -->|是| Success[到達上限位]
+    Success --> TurnOffRelay1[關閉繼電器]
+    TurnOffRelay1 --> StopTimer1[停止計時器]
+    StopTimer1 --> SetIdle1[設定狀態<br/>→ IDLE/TEST]
+    SetIdle1 --> PlayComplete1[播放完成音效]
+    PlayComplete1 --> End1([上升完成])
+    
+    CheckUpper -->|否| CheckTimeout{計時器<br/>是否超時?}
+    
+    CheckTimeout -->|是| Timeout[超時錯誤]
+    Timeout --> TurnOffRelay2[關閉繼電器]
+    TurnOffRelay2 --> StopTimer2[停止計時器]
+    StopTimer2 --> SetError[設定狀態<br/>→ ERROR]
+    SetError --> PlayError[播放錯誤音效]
+    PlayError --> End2([上升失敗])
+    
+    CheckTimeout -->|否| CheckIR{是否收到<br/>IR切換指令?}
+    
+    CheckIR -->|是| Cancel[取消上升]
+    Cancel --> TurnOffRelay3[關閉繼電器]
+    TurnOffRelay3 --> StopTimer3[停止計時器]
+    StopTimer3 --> Delay[短暫延遲<br/>100ms]
+    Delay --> SwitchDown[切換為下降]
+    SwitchDown --> End3([切換完成])
+    
+    CheckIR -->|否| LoopStart
+    
+    Reject --> End4([指令拒絕])
+    
+    style TurnOnRelay fill:#a5d6a7
+    style TurnOffRelay1 fill:#ef9a9a
+    style TurnOffRelay2 fill:#ef9a9a
+    style TurnOffRelay3 fill:#ef9a9a
+    style Success fill:#c8e6c9
+    style Timeout fill:#ffcdd2
+    style End1 fill:#c8e6c9
+    style End2 fill:#ffcdd2
+```
+
+## 5. 下降動作流程
+
+```mermaid
+flowchart TD
+    Start([啟動下降指令]) --> CheckState{檢查狀態<br/>是否為IDLE?}
+    
+    CheckState -->|否| Reject[拒絕執行<br/>非待機狀態]
+    CheckState -->|是| LogStart[記錄日誌<br/>下降啟動]
+    
+    LogStart --> SetState[設定狀態<br/>→ MOVING_DOWN]
+    SetState --> TurnOnRelay[開啟繼電器]
+    TurnOnRelay --> StartTimer[啟動計時器]
+    StartTimer --> PlaySound[播放下降音效]
+    PlaySound --> LoopStart[進入下降循環]
+    
+    LoopStart --> CheckLower{檢查下限位<br/>是否觸發?}
+    
+    CheckLower -->|是| Success[到達下限位]
+    Success --> TurnOffRelay1[關閉繼電器]
+    TurnOffRelay1 --> StopTimer1[停止計時器]
+    StopTimer1 --> SetIdle1[設定狀態<br/>→ IDLE/TEST]
+    SetIdle1 --> PlayComplete1[播放完成音效]
+    PlayComplete1 --> End1([下降完成])
+    
+    CheckLower -->|否| CheckTimeout{計時器<br/>是否超時?}
+    
+    CheckTimeout -->|是| Timeout[超時錯誤]
+    Timeout --> TurnOffRelay2[關閉繼電器]
+    TurnOffRelay2 --> StopTimer2[停止計時器]
+    StopTimer2 --> SetError[設定狀態<br/>→ ERROR]
+    SetError --> PlayError[播放錯誤音效]
+    PlayError --> End2([下降失敗])
+    
+    CheckTimeout -->|否| CheckIR{是否收到<br/>IR切換指令?}
+    
+    CheckIR -->|是| Cancel[取消下降]
+    Cancel --> TurnOffRelay3[關閉繼電器]
+    TurnOffRelay3 --> StopTimer3[停止計時器]
+    StopTimer3 --> Delay[短暫延遲<br/>100ms]
+    Delay --> SwitchUp[切換為上升]
+    SwitchUp --> End3([切換完成])
+    
+    CheckIR -->|否| LoopStart
+    
+    Reject --> End4([指令拒絕])
+    
+    style TurnOnRelay fill:#a5d6a7
+    style TurnOffRelay1 fill:#ef9a9a
+    style TurnOffRelay2 fill:#ef9a9a
+    style TurnOffRelay3 fill:#ef9a9a
+    style Success fill:#c8e6c9
+    style Timeout fill:#ffcdd2
+    style End1 fill:#c8e6c9
+    style End2 fill:#ffcdd2
+```
+
+## 6. 自動上升觸發流程
+
+```mermaid
+flowchart TD
+    Start([主循環]) --> CheckState{當前狀態<br/>是否為IDLE?}
+    
+    CheckState -->|否| Skip1[跳過檢查]
+    CheckState -->|是| CheckAuto{自動模式<br/>是否開啟?}
+    
+    CheckAuto -->|否| Skip2[跳過檢查]
+    CheckAuto -->|是| CheckSpeed{速度是否<br/>≥ 15 km/h?}
+    
+    CheckSpeed -->|否| Skip3[跳過檢查]
+    CheckSpeed -->|是| CheckPosition{是否在<br/>下限位?}
+    
+    CheckPosition -->|否| Skip4[跳過檢查]
+    CheckPosition -->|是| Trigger[觸發自動上升]
+    
+    Trigger --> LogSpeed[記錄當前速度]
+    LogSpeed --> StartUp[執行上升動作]
+    StartUp --> End([自動上升啟動])
+    
+    Skip1 --> Continue([繼續主循環])
+    Skip2 --> Continue
+    Skip3 --> Continue
+    Skip4 --> Continue
+    
+    style Trigger fill:#c8e6c9
+    style StartUp fill:#a5d6a7
+    style End fill:#c8e6c9
+```
+
+## 7. 按鈕控制流程
+
+```mermaid
+flowchart TD
+    Start([讀取按鈕]) --> ReadState[讀取當前狀態]
+    
+    ReadState --> CheckPress{按下瞬間?}
+    
+    CheckPress -->|是| RecordStart[記錄按下時間<br/>重置長按標記]
+    CheckPress -->|否| CheckHold{持續按住?}
+    
+    CheckHold -->|是| CheckDuration{按住時間<br/>≥ 2 秒?}
+    CheckDuration -->|是且未處理| LongPress[長按觸發]
+    CheckDuration -->|否| WaitMore[繼續等待]
+    CheckDuration -->|已處理| WaitRelease[等待放開]
+    
+    LongPress --> ToggleAuto[切換自動上升模式]
+    ToggleAuto --> CheckAutoState{自動模式<br/>新狀態?}
+    
+    CheckAutoState -->|開啟| PlayHigh[播放高音]
+    CheckAutoState -->|關閉| PlayLow[播放低音]
+    
+    PlayHigh --> LogAuto1[記錄: 自動模式開啟]
+    PlayLow --> LogAuto2[記錄: 自動模式關閉]
+    
+    LogAuto1 --> MarkHandled1[標記已處理]
+    LogAuto2 --> MarkHandled2[標記已處理]
+    
+    CheckHold -->|否| CheckRelease{放開瞬間?}
+    
+    CheckRelease -->|否| End1([按鈕處理完成])
+    CheckRelease -->|是| CalcDuration[計算按下時長]
+    
+    CalcDuration --> CheckShort{時長 < 2 秒?}
+    
+    CheckShort -->|是| ShortPress[短按觸發]
+    CheckShort -->|否| LongRelease[長按放開]
+    
+    ShortPress --> SwitchPage[切換OLED頁面]
+    SwitchPage --> PlayBeep[播放短音]
+    PlayBeep --> LogPage[記錄頁面切換]
+    
+    LogPage --> End2([按鈕處理完成])
+    LongRelease --> End3([按鈕處理完成])
+    RecordStart --> End4([按鈕處理完成])
+    WaitMore --> End5([按鈕處理完成])
+    WaitRelease --> End6([按鈕處理完成])
+    MarkHandled1 --> End7([按鈕處理完成])
+    MarkHandled2 --> End8([按鈕處理完成])
+    
+    style LongPress fill:#fff9c4
+    style ShortPress fill:#c8e6c9
+    style ToggleAuto fill:#ffe0b2
+```
+
+## 8. 主循環結構
+
+```mermaid
+flowchart TD
+    Start([Loop 開始]) --> ReadSensors[讀取所有感測器]
+    
+    ReadSensors --> UpdateSwitches[更新磁簧開關狀態]
+    UpdateSwitches --> UpdateSpeed[更新速度測量]
+    UpdateSpeed --> HandleInput[處理輸入]
+    
+    HandleInput --> HandleIR[處理 IR 指令]
+    HandleIR --> HandleButton[處理按鈕]
+    HandleButton --> CheckErrors[檢查異常狀態]
+    
+    CheckErrors --> CheckBothSwitches{兩磁簧<br/>同時觸發?}
+    
+    CheckBothSwitches -->|是| EmergencyStop[緊急停止<br/>→ ERROR]
+    CheckBothSwitches -->|否| StateMachine[狀態機處理]
+    
+    StateMachine --> CheckCurrentState{檢查當前狀態}
+    
+    CheckCurrentState -->|INIT| ProcessInit[執行初始化流程]
+    CheckCurrentState -->|IDLE| CheckAutoUp[檢查自動上升條件]
+    CheckCurrentState -->|TEST_MODE| CheckAutoUp
+    CheckCurrentState -->|MOVING_DOWN| ProcessDown[處理下降動作]
+    CheckCurrentState -->|MOVING_UP| ProcessUp[處理上升動作]
+    CheckCurrentState -->|ERROR| DoNothing[無動作<br/>等待重啟]
+    
+    ProcessInit --> UpdateOutputs[更新輸出]
+    CheckAutoUp --> UpdateOutputs
+    ProcessDown --> UpdateOutputs
+    ProcessUp --> UpdateOutputs
+    DoNothing --> UpdateOutputs
+    EmergencyStop --> UpdateOutputs
+    
+    UpdateOutputs --> UpdateRGB[更新 RGB LED]
+    UpdateRGB --> UpdateDisplay[更新 OLED 顯示]
+    UpdateDisplay --> PrintStatus[輸出狀態到串口]
+    
+    PrintStatus --> LoopEnd([Loop 結束])
+    LoopEnd --> Start
+    
+    style Start fill:#e1f5ff
+    style EmergencyStop fill:#ffcdd2
+    style UpdateOutputs fill:#c8e6c9
+    style LoopEnd fill:#e1f5ff
+```
+
+## 9. 錯誤處理流程
+
+```mermaid
+flowchart TD
+    Start([偵測到錯誤]) --> CheckType{錯誤類型?}
+    
+    CheckType -->|兩磁簧同時觸發| Error1[BOTH_SWITCHES_ERROR]
+    CheckType -->|上升超時| Error2[TIMEOUT_ERROR]
+    CheckType -->|下降超時| Error3[TIMEOUT_ERROR]
+    CheckType -->|初始化超時| Error4[INIT_TIMEOUT_ERROR]
+    
+    Error1 --> CommonActions[共同處理]
+    Error2 --> CommonActions
+    Error3 --> CommonActions
+    Error4 --> CommonActions
+    
+    CommonActions --> StopRelay[關閉繼電器]
+    StopRelay --> StopTimer[停止計時器]
+    StopTimer --> SetErrorState[設定狀態<br/>→ ERROR_STATE]
+    SetErrorState --> RecordType[記錄錯誤類型]
+    RecordType --> PlayError[播放錯誤音效]
+    
+    PlayError --> LogError[輸出錯誤日誌]
+    LogError --> LockSystem[鎖定系統]
+    
+    LockSystem --> ErrorLoop[錯誤循環]
+    ErrorLoop --> FlashRed[紅色LED閃爍]
+    FlashRed --> ShowError[OLED顯示錯誤]
+    ShowError --> WaitReset{等待重啟}
+    
+    WaitReset -->|IR按下| IgnoreIR[忽略IR<br/>播放錯誤音]
+    WaitReset -->|按鈕按下| IgnoreButton[忽略按鈕]
+    WaitReset -->|系統重啟| SystemReset[系統重新啟動]
+    
+    IgnoreIR --> ErrorLoop
+    IgnoreButton --> ErrorLoop
+    SystemReset --> End([錯誤處理結束])
+    
+    style Error1 fill:#ffcdd2
+    style Error2 fill:#ffcdd2
+    style Error3 fill:#ffcdd2
+    style Error4 fill:#ffcdd2
+    style LockSystem fill:#f44336
+    style SystemReset fill:#c8e6c9
+```
+
+## 10. 速度測量流程
+
+```mermaid
+flowchart TD
+    Start([霍爾感測器中斷]) --> ReadTime[讀取當前時間<br/>micros]
+    
+    ReadTime --> CalcInterval[計算脈衝間隔<br/>= 當前時間 - 上次時間]
+    
+    CalcInterval --> CheckMin{間隔是否<br/>≥ 40ms?}
+    
+    CheckMin -->|否| IgnorePulse[忽略脈衝<br/>防止雜訊]
+    CheckMin -->|是| ValidPulse[有效脈衝]
+    
+    ValidPulse --> SaveInterval[儲存脈衝間隔]
+    SaveInterval --> SaveTime[更新上次觸發時間]
+    SaveTime --> SetFlag[設定新數據標記]
+    
+    SetFlag --> EndInterrupt([中斷處理完成])
+    IgnorePulse --> EndInterrupt
+    
+    EndInterrupt -.-> MainLoop([主循環處理])
+    
+    MainLoop --> CheckFlag{是否有<br/>新數據?}
+    
+    CheckFlag -->|否| CheckTimeout{是否超時<br/>> 2 秒?}
+    CheckFlag -->|是| CalcSpeed[計算速度]
+    
+    CalcSpeed --> Formula[速度 = 周長 / 時間 × 3.6]
+    Formula --> Validate{速度是否<br/>合理?<br/>0~50 km/h}
+    
+    Validate -->|是| UpdateSpeed[更新當前速度]
+    Validate -->|否| DiscardSpeed[捨棄異常數據]
+    
+    UpdateSpeed --> ClearFlag[清除新數據標記]
+    ClearFlag --> MarkTime[標記更新時間]
+    
+    CheckTimeout -->|是| ZeroSpeed[速度歸零]
+    CheckTimeout -->|否| KeepSpeed[保持當前速度]
+    
+    MarkTime --> EndMain([速度處理完成])
+    DiscardSpeed --> EndMain
+    ZeroSpeed --> EndMain
+    KeepSpeed --> EndMain
+    
+    style ValidPulse fill:#c8e6c9
+    style IgnorePulse fill:#ffcdd2
+    style UpdateSpeed fill:#c8e6c9
+    style DiscardSpeed fill:#ffcdd2
+```
+
+---
+
+## 圖表說明
+
+### 顏色標示：
+- 🟦 **藍色**：啟動/開始節點
+- 🟩 **綠色**：成功/正常執行
+- 🟥 **紅色**：錯誤/失敗/停止
+- 🟨 **黃色**：警告/特殊狀態
+- 🟧 **橘色**：繼電器操作
+
+### 主要流程：
+1. **狀態機**：系統整體運作邏輯
+2. **初始化**：自動校正找基準位置
+3. **IR控制**：三層過濾機制
+4. **上升/下降**：包含超時保護
+5. **自動上升**：速度觸發條件
+6. **按鈕**：短按/長按不同功能
+7. **主循環**：每次循環的完整流程
+8. **錯誤處理**：異常情況處理
+9. **速度測量**：霍爾感測器中斷處理
+
+### 關鍵保護機制：
+- ✅ 10秒超時保護
+- ✅ 磁簧防彈跳 50ms
+- ✅ IR防彈跳 800ms
+- ✅ 兩磁簧同時觸發偵測
+- ✅ 速度合理性檢查
+- ✅ 錯誤狀態鎖定
