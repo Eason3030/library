@@ -62,7 +62,7 @@ namespace Config {
   const uint32_t MIN_PULSE_INTERVAL_US = 40000;  // 最小脈衝間隔 (40ms)
 
   // 時間保護
-  const unsigned long MOTION_TIMEOUT_MS = 10000;      // 動作超時 10 秒
+  const unsigned long MOTION_TIMEOUT_MS = 20000;      // 動作超時 20 秒
   const unsigned long SPEED_TIMEOUT_MS = 2000;        // 速度超時 2 秒
   const unsigned long DEBOUNCE_MS = 50;               // 防彈跳時間
   const unsigned long INIT_HOLD_MS = 500;             // 初始化到位後等待時間
@@ -412,7 +412,22 @@ void processInitialization() {
   switch(g_init.phase) {
     case INIT_START:
       Serial.println(F("\n[初始化] 開始自動校正"));
-      Serial.println(F("  策略：搜尋上限位 → 移動至下限位"));
+      Serial.println(F("  策略：給電旋轉 → 經過上磁簧 → 到達下磁簧"));
+
+      // 檢查啟動位置
+      if (g_switches.upperTriggered) {
+        Serial.println(F("[初始化] 啟動時已在上限位，直接尋找下限位"));
+        g_init.upperSeen = true;  // 直接認為已經過上磁簧
+      } else if (g_switches.lowerTriggered) {
+        Serial.println(F("[初始化] 啟動時已在下限位，初始化完成"));
+        g_init.phase = INIT_COMPLETED;
+        g_state = IDLE;
+        playInitComplete();
+        return;
+      } else {
+        Serial.println(F("[初始化] 啟動時在中間位置"));
+      }
+
       g_relay.turnOn();
       g_motionTimer.start();
       g_init.phase = INIT_SEARCHING;
@@ -420,27 +435,35 @@ void processInitialization() {
       break;
 
     case INIT_SEARCHING:
-      // 搜尋上限位
+      // 搜尋上限位（只在第一次觸發時記錄）
       if (g_switches.upperTriggered && !g_init.upperSeen) {
         Serial.println(F("[初始化] 找到上限位，繼續移動"));
         g_init.upperSeen = true;
-        g_init.phase = INIT_MOVING_TO_LOWER;
       }
 
-      // 如果直接碰到下限位（啟動時就在下方）
+      // 如果已經過上磁簧，切換到等待下磁簧模式
+      if (g_init.upperSeen) {
+        g_init.phase = INIT_MOVING_TO_LOWER;
+        Serial.println(F("[初始化] 已過上限位，等待下限位"));
+      }
+
+      // 如果直接碰到下限位（沒經過上限位也允許）
       if (g_switches.lowerTriggered) {
-        Serial.println(F("[初始化] 啟動時已在下限位"));
+        Serial.println(F("[初始化] 到達下限位"));
         g_relay.turnOff();
         g_motionTimer.stop();
         delay(Config::INIT_HOLD_MS);
         g_init.phase = INIT_COMPLETED;
         g_state = IDLE;
         playInitComplete();
+        Serial.println(F("[初始化] 完成！系統進入待機"));
       }
 
       // 超時檢查
       if (g_motionTimer.hasTimeout()) {
         Serial.println(F("[初始化] 失敗 - 超時未找到限位"));
+        Serial.print(F("  upperSeen: "));
+        Serial.println(g_init.upperSeen ? "是" : "否");
         g_relay.turnOff();
         g_init.phase = INIT_FAILED;
         g_state = ERROR_STATE;
@@ -465,6 +488,10 @@ void processInitialization() {
       // 超時檢查
       if (g_motionTimer.hasTimeout()) {
         Serial.println(F("[初始化] 失敗 - 超時未到達下限位"));
+        Serial.print(F("  當前位置 - UP: "));
+        Serial.print(g_switches.upperTriggered ? "ON" : "off");
+        Serial.print(F(", DN: "));
+        Serial.println(g_switches.lowerTriggered ? "ON" : "off");
         g_relay.turnOff();
         g_init.phase = INIT_FAILED;
         g_state = ERROR_STATE;
