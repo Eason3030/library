@@ -101,11 +101,7 @@
 ---
 
 ### 7. 系統流程圖
-```mermaid
-
-## 1. 系統整體狀態機
-
-```mermaid
+```mermai
 stateDiagram-v2
     [*] --> 上電啟動
     
