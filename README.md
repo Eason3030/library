@@ -1,644 +1,682 @@
+# 輔助輪控制系統 v10.1
 
-# 自行車輔助輪控制系統
+> 🚲 基於 Arduino Mega 的智能自行車輔助輪控制系統
 
-## 專案概述
-你的系統構想是一套完整的自行車輔助輪智能控制系統，核心目標是結合安全、可控與易於監測的功能。系統以三種主要感測資訊為偵測基礎：速度、傾斜角度與電流。速度感測可判斷車速，提供輔助輪自動收放或防跌倒的判斷依據；角度感測透過 MPU6050 或其他 IMU 取得車身傾斜資訊，用於偵測可能的傾倒風險；電流感測則可偵測線性制動器的負載狀態，防止馬達過載或異常耗電，保護硬體安全。
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Arduino](https://img.shields.io/badge/Arduino-Mega%202560-00979D.svg)](https://www.arduino.cc/)
+[![Version](https://img.shields.io/badge/version-10.1-green.svg)](CHANGELOG.md)
 
-在控制端，你希望操作線性制動器能夠精準控制輔助輪的上升或下降。線性制動器以固定方向旋轉操作，確保機構簡單且可靠，並搭配 PWM 控制調節轉動速度，使系統能夠平滑升降，同時提供緊急斷電功能以應對意外狀況。使用者可以透過 IR 遙控器直接操作輔助輪上升或下降，例如家長在小孩快跌倒或需要完全升起輔助輪時，可即時介入。緊急停止按鈕則可隨時暫停整個系統或啟動重置流程，按下即生效，不需長按，確保快速應對意外。
+## 📋 目錄
 
-顯示部分分為 OLED 與 RGB LED。OLED 顯示用於呈現精確資訊，包括即時速度、車身傾角與系統狀態，讓使用者或監護人能清楚掌握運行情況；RGB LED 則以不同顏色直觀顯示當前系統狀態，如自動控制、手動操作、安全警告或緊急停機，便於快速辨識。
-
-軟體功能部分，I2C 通訊加入超時防護與自動重啟機制，搭配硬體看門狗，確保系統即使在通訊異常或感測器失效時，也能自我恢復，維持穩定運作。序列埠則用於除錯與診斷，輸出包括優先權、速度、角度、PWM 值、感測電流以及各種狀態訊息，方便開發與維護。整體系統的設計邏輯強調安全優先、即時控制與資訊透明，使自行車輔助輪在保護小孩安全的同時，也提供家長及使用者良好的操作體驗。
----
-
-## 系統功能
-
-### 1. 輔助輪控制
-
-#### 手動模式
-- **紅外線遙控**：使用紅外線遙控器切換輔助輪 UP / DOWN 狀態。  
-- **磁簧開關**：偵測輔助輪上下限位，避免機構過行程。  
-- **RGB LED 指示**：
-  - DOWN：黃色  
-  - UP：綠色  
-- **音效提示**：輔助輪放下與收起時播放不同提示音。
-
-#### 自動模式（速度控制）
-- 速度 < 10 km/h → 自動放下輔助輪（磁簧確認下限）。  
-- 速度 ≥ 10 km/h → 自動收起輔助輪（磁簧確認上限）。  
-- **RGB LED 顯示**：
-  - 低速：黃色  
-  - 高速：綠色  
-
-#### 傾斜警告保護
-- 當傾斜角度 > 20° 且持續 0.5 秒：
-  - 自動放下輔助輪（磁簧確認下限）  
-  - RGB LED 顯示藍色  
-  - 播放警告音  
-- 當傾斜角度 < 12° 且持續 3 秒：
-  - 自動收起輔助輪（磁簧確認上限）  
-  - RGB LED 回復綠色  
-
-#### 緊急停止（最高優先）
-- 傾斜角度 > 35° 或電流過載 → 立即鎖定輔助輪下降（磁簧確認下限）、紅燈警報、播放緊急音效。  
-- 當角度 < 12° 並確認安全後，解除緊急狀態。
+- [系統簡介](#系統簡介)
+- [系統架構](#系統架構)
+- [流程圖](#流程圖)
+- [硬體配置](#硬體配置)
+- [安裝說明](#安裝說明)
+- [使用方式](#使用方式)
+- [安全機制](#安全機制)
+- [常見問題](#常見問題)
 
 ---
 
-### 2. 感測與控制模組
-- **MPU6050**：取得加速度與角速度資料，計算即時傾斜角度。  
-- **磁簧開關**：
-  - 偵測輔助輪端點位置  
-  - 判斷手動操作是否超過上下限  
-- **速度感測模組**：透過霍爾脈衝計算即時行駛速度。  
-- **紅外線接收器**：接收使用者遙控指令。  
-- **INA226 電流監測**：偵測系統電流狀態，用於安全保護。
+## 🎯 系統簡介
+
+本系統為木柵高工電子科專題製作，實現智能輔助輪自動控制：
+
+### 核心功能
+- ✅ **自動初始化** - 開機自動校正位置
+- ✅ **紅外線控制** - 一鍵切換上升/下降
+- ✅ **速度觸發** - 達 15 km/h 自動收起
+- ✅ **10 秒超時保護** - 防止機構卡死
+- ✅ **OLED 即時顯示** - 中文操作介面
+- ✅ **RGB 狀態指示** - 不同顏色對應不同狀態
+
+### 三句話理解系統
+1. **初始化**：開機自動找上下限位，確定基準位置
+2. **控制**：IR 按一下切換上升/下降，可中途改變方向
+3. **保護**：10 秒超時、限位觸發、錯誤鎖定三重保護
 
 ---
 
-### 3. 顯示與互動
-- **OLED 顯示器**：
-  - 顯示系統狀態、輔助輪 UP/DOWN、即時速度、傾斜角度  
-  - 提供啟動畫面與測試畫面  
-- **RGB LED 狀態提示**：以顏色快速顯示系統目前狀態  
-- **音效提示**：
-  - 系統啟動提示音  
-  - 輔助輪動作提示音  
-  - 傾斜警告音  
-  - 緊急警報音  
+## 🏗️ 系統架構
 
----
-
-### 4. 測試功能
-- OLED 顯示測試  
-- 紅外線接收測試  
-- MPU6050 姿態讀值測試  
-- 磁簧開關與速度感測測試  
-- RGB LED 顏色與音效確認  
-- 測試結果同步顯示於 OLED 並以音效回饋
-
----
-
-### 5. 系統設計重點
-- 採用 **三層決策邏輯**：
-  1. 安全層（最高優先）  
-  2. 傾斜保護層  
-  3. 操作控制層  
-- 採用非阻塞式設計（以 `millis()` 為基礎），提升即時反應能力  
-- 高風險狀態可直接中斷低優先權控制邏輯  
-
----
-
-### 6. RGB LED 狀態指示
-| 顏色 | 狀態說明 |
-|------|-----------|
-| 🟢 綠色 | 正常行駛，速度 ≥ 10 km/h，輔助輪 UP |
-| 🟡 黃色 | 輔助輪 DOWN（低速或手動） |
-| 🔵 藍色 | 傾斜警告（角度 > 20°） |
-| 🔴 紅色 | 緊急狀態（角度 > 35° 或安全保護） |
-| 🟣 紫色 | 保留狀態（未使用） |
-
----
-
+### 整體狀態機
 
 ```mermaid
-flowchart TD
-    [*] --> 上電啟動
+stateDiagram-v2
+    [*] --> INIT: 上電
     
-    上電啟動 --> 檢查測試模式: 讀取按鈕
+    INIT --> IDLE: 初始化成功
+    INIT --> ERROR: 失敗
     
-    檢查測試模式 --> INIT: 按鈕未按下
-    檢查測試模式 --> TEST_MODE: 按鈕按住
+    IDLE --> MOVING_UP: IR上升/自動
+    IDLE --> MOVING_DOWN: IR下降
     
-    INIT --> 初始化流程
+    MOVING_UP --> IDLE: 到達上限
+    MOVING_DOWN --> IDLE: 到達下限
     
-    初始化流程 --> IDLE: 初始化成功
-    初始化流程 --> ERROR: 初始化失敗
-    
-    IDLE --> MOVING_UP: IR指令/自動觸發
-    IDLE --> MOVING_DOWN: IR指令
-    
-    MOVING_UP --> IDLE: 到達上限位
     MOVING_UP --> ERROR: 超時10秒
-    MOVING_UP --> MOVING_DOWN: IR中途切換
-    
-    MOVING_DOWN --> IDLE: 到達下限位
     MOVING_DOWN --> ERROR: 超時10秒
-    MOVING_DOWN --> MOVING_UP: IR中途切換
     
-    TEST_MODE --> MOVING_UP: IR指令
-    TEST_MODE --> MOVING_DOWN: IR指令
+    MOVING_UP --> MOVING_DOWN: IR切換
+    MOVING_DOWN --> MOVING_UP: IR切換
     
-    MOVING_UP --> TEST_MODE: 測試模式到達限位
-    MOVING_DOWN --> TEST_MODE: 測試模式到達限位
-    
-    ERROR --> [*]: 需重啟系統
-    
-    note right of IDLE
-        RGB: 青色
-        繼電器: 關閉
-        等待指令
-    end note
-    
-    note right of MOVING_UP
-        RGB: 綠色
-        繼電器: 開啟
-        監測上限位
-    end note
-    
-    note right of MOVING_DOWN
-        RGB: 紅色
-        繼電器: 開啟
-        監測下限位
-    end note
-    
-    note right of ERROR
-        RGB: 紅色閃爍
-        繼電器: 關閉
-        系統鎖定
-    end note
+    ERROR --> [*]: 重啟
 ```
 
-## 2. 初始化流程詳細圖
+### 狀態說明
+
+| 狀態 | RGB 顏色 | 繼電器 | 說明 |
+|-----|---------|-------|------|
+| **INIT** | 紫色閃爍 | 開啟 | 自動搜尋基準位置 |
+| **IDLE** | 青色 | 關閉 | 待機，等待指令 |
+| **MOVING_UP** | 綠色 | 開啟 | 上升中，監測上限位 |
+| **MOVING_DOWN** | 紅色 | 開啟 | 下降中，監測下限位 |
+| **ERROR** | 紅色閃爍 | 關閉 | 系統鎖定，需重啟 |
+
+---
+
+## 📊 流程圖
+
+### 1. 初始化流程
 
 ```mermaid
 flowchart TD
-    Start([系統啟動]) --> CheckButton{檢查按鈕<br/>是否按住?}
+    Start([啟動]) --> RelayOn[開啟繼電器]
+    RelayOn --> Search[搜尋限位]
+    Search --> UpperFound{找到上限?}
+    UpperFound -->|是| GoDown[繼續往下]
+    UpperFound -->|否| Timeout1{超時?}
+    Timeout1 -->|是| Fail[失敗]
+    Timeout1 -->|否| Search
     
-    CheckButton -->|是| TestMode[進入測試模式<br/>跳過初始化]
-    CheckButton -->|否| InitStart[INIT_START<br/>準備初始化]
+    GoDown --> LowerFound{找到下限?}
+    LowerFound -->|是| Success[成功→IDLE]
+    LowerFound -->|否| Timeout2{超時?}
+    Timeout2 -->|是| Fail
+    Timeout2 -->|否| GoDown
     
-    InitStart --> ReadSwitch[讀取磁簧狀態]
-    ReadSwitch --> TurnOnRelay[開啟繼電器<br/>啟動馬達]
-    TurnOnRelay --> StartTimer[啟動超時計時器<br/>10秒]
-    StartTimer --> Searching[INIT_SEARCHING<br/>搜尋上限位]
-    
-    Searching --> CheckLower1{檢查下限位<br/>是否觸發?}
-    CheckLower1 -->|是| AlreadyDown[已在下限位]
-    AlreadyDown --> StopRelay1[關閉繼電器]
-    StopRelay1 --> Complete1[初始化完成<br/>→ IDLE]
-    
-    CheckLower1 -->|否| CheckUpper{檢查上限位<br/>是否觸發?}
-    CheckUpper -->|否| CheckTimeout1{是否超時?}
-    CheckTimeout1 -->|是| Failed1[初始化失敗<br/>→ ERROR]
-    CheckTimeout1 -->|否| Searching
-    
-    CheckUpper -->|是| UpperFound[找到上限位<br/>記錄事件]
-    UpperFound --> MovingToLower[INIT_MOVING_TO_LOWER<br/>繼續移動至下限]
-    
-    MovingToLower --> CheckLower2{檢查下限位<br/>是否觸發?}
-    CheckLower2 -->|是| ReachLower[到達下限位]
-    ReachLower --> StopRelay2[關閉繼電器]
-    StopRelay2 --> Delay[等待500ms<br/>穩定]
-    Delay --> Complete2[初始化完成<br/>→ IDLE]
-    
-    CheckLower2 -->|否| CheckTimeout2{是否超時?}
-    CheckTimeout2 -->|是| Failed2[初始化失敗<br/>→ ERROR]
-    CheckTimeout2 -->|否| MovingToLower
-    
-    Complete1 --> PlaySound1[播放完成音效]
-    Complete2 --> PlaySound2[播放完成音效]
-    Failed1 --> PlayError1[播放錯誤音效]
-    Failed2 --> PlayError2[播放錯誤音效]
-    
-    PlaySound1 --> End([進入待機狀態])
-    PlaySound2 --> End
-    PlayError1 --> ErrorState([進入錯誤狀態])
-    PlayError2 --> ErrorState
-    
-    TestMode --> TestEnd([測試模式待機])
-    
-    style Start fill:#e1f5ff
-    style End fill:#c8e6c9
-    style ErrorState fill:#ffcdd2
-    style TestEnd fill:#fff9c4
-    style TurnOnRelay fill:#ffe0b2
-    style StopRelay1 fill:#ffe0b2
-    style StopRelay2 fill:#ffe0b2
-```
-
-## 3. IR 控制流程
-
-```mermaid
-flowchart TD
-    IRStart([接收到IR信號]) --> DecodeIR[解碼IR數據]
-    
-    DecodeIR --> CheckNull{代碼是否<br/>為 0x0000?}
-    CheckNull -->|是| IgnoreNull[忽略: 空碼]
-    CheckNull -->|否| CheckRepeat{代碼是否<br/>為 0xFFFF?}
-    
-    CheckRepeat -->|是| IgnoreRepeat[忽略: 重複碼]
-    CheckRepeat -->|否| CheckDebounce{距上次按下<br/>是否 < 800ms?}
-    
-    CheckDebounce -->|是| IgnoreDebounce[忽略: 防彈跳]
-    CheckDebounce -->|否| ValidSignal[有效信號<br/>記錄時間]
-    
-    ValidSignal --> CheckState{檢查當前狀態}
-    
-    CheckState -->|INIT| ActionInit[提示音<br/>忽略指令]
-    CheckState -->|ERROR| ActionError[錯誤音<br/>需重啟]
-    CheckState -->|IDLE/TEST| CheckPosition{檢查磁簧位置}
-    CheckState -->|MOVING_UP| ActionReverse1[停止上升<br/>切換下降]
-    CheckState -->|MOVING_DOWN| ActionReverse2[停止下降<br/>切換上升]
-    
-    CheckPosition -->|在下限位| ActionUp[啟動上升]
-    CheckPosition -->|在上限位| ActionDown[啟動下降]
-    CheckPosition -->|在中間| ActionDefault[預設下降]
-    CheckPosition -->|兩限位同時觸發| ActionStop[停止<br/>異常狀態]
-    
-    ActionUp --> ExecuteUp[執行上升動作]
-    ActionDown --> ExecuteDown[執行下降動作]
-    ActionDefault --> ExecuteDown
-    ActionReverse1 --> ExecuteDown
-    ActionReverse2 --> ExecuteUp
-    
-    ExecuteUp --> EndProcess([IR處理完成])
-    ExecuteDown --> EndProcess
-    ActionInit --> EndProcess
-    ActionError --> EndProcess
-    ActionStop --> EndProcess
-    
-    IgnoreNull --> EndProcess
-    IgnoreRepeat --> EndProcess
-    IgnoreDebounce --> EndProcess
-    
-    style ValidSignal fill:#c8e6c9
-    style IgnoreNull fill:#ffcdd2
-    style IgnoreRepeat fill:#ffcdd2
-    style IgnoreDebounce fill:#ffcdd2
-    style ExecuteUp fill:#a5d6a7
-    style ExecuteDown fill:#ef9a9a
-```
-
-## 4. 上升動作流程
-
-```mermaid
-flowchart TD
-    Start([啟動上升指令]) --> CheckState{檢查狀態<br/>是否為IDLE?}
-    
-    CheckState -->|否| Reject[拒絕執行<br/>非待機狀態]
-    CheckState -->|是| LogStart[記錄日誌<br/>上升啟動]
-    
-    LogStart --> SetState[設定狀態<br/>→ MOVING_UP]
-    SetState --> TurnOnRelay[開啟繼電器]
-    TurnOnRelay --> StartTimer[啟動計時器]
-    StartTimer --> PlaySound[播放上升音效]
-    PlaySound --> LoopStart[進入上升循環]
-    
-    LoopStart --> CheckUpper{檢查上限位<br/>是否觸發?}
-    
-    CheckUpper -->|是| Success[到達上限位]
-    Success --> TurnOffRelay1[關閉繼電器]
-    TurnOffRelay1 --> StopTimer1[停止計時器]
-    StopTimer1 --> SetIdle1[設定狀態<br/>→ IDLE/TEST]
-    SetIdle1 --> PlayComplete1[播放完成音效]
-    PlayComplete1 --> End1([上升完成])
-    
-    CheckUpper -->|否| CheckTimeout{計時器<br/>是否超時?}
-    
-    CheckTimeout -->|是| Timeout[超時錯誤]
-    Timeout --> TurnOffRelay2[關閉繼電器]
-    TurnOffRelay2 --> StopTimer2[停止計時器]
-    StopTimer2 --> SetError[設定狀態<br/>→ ERROR]
-    SetError --> PlayError[播放錯誤音效]
-    PlayError --> End2([上升失敗])
-    
-    CheckTimeout -->|否| CheckIR{是否收到<br/>IR切換指令?}
-    
-    CheckIR -->|是| Cancel[取消上升]
-    Cancel --> TurnOffRelay3[關閉繼電器]
-    TurnOffRelay3 --> StopTimer3[停止計時器]
-    StopTimer3 --> Delay[短暫延遲<br/>100ms]
-    Delay --> SwitchDown[切換為下降]
-    SwitchDown --> End3([切換完成])
-    
-    CheckIR -->|否| LoopStart
-    
-    Reject --> End4([指令拒絕])
-    
-    style TurnOnRelay fill:#a5d6a7
-    style TurnOffRelay1 fill:#ef9a9a
-    style TurnOffRelay2 fill:#ef9a9a
-    style TurnOffRelay3 fill:#ef9a9a
     style Success fill:#c8e6c9
-    style Timeout fill:#ffcdd2
-    style End1 fill:#c8e6c9
-    style End2 fill:#ffcdd2
+    style Fail fill:#ffcdd2
 ```
 
-## 5. 下降動作流程
+**邏輯：** 開機 → 找上限 → 找下限 → 完成
+
+---
+
+### 2. IR 控制流程
 
 ```mermaid
 flowchart TD
-    Start([啟動下降指令]) --> CheckState{檢查狀態<br/>是否為IDLE?}
+    IR([接收IR]) --> Filter{過濾}
+    Filter -->|空碼/重複| Ignore[忽略]
+    Filter -->|有效| Check{當前狀態?}
     
-    CheckState -->|否| Reject[拒絕執行<br/>非待機狀態]
-    CheckState -->|是| LogStart[記錄日誌<br/>下降啟動]
+    Check -->|IDLE下限| Up[上升]
+    Check -->|IDLE上限| Down[下降]
+    Check -->|上升中| SwitchD[改下降]
+    Check -->|下降中| SwitchU[改上升]
     
-    LogStart --> SetState[設定狀態<br/>→ MOVING_DOWN]
-    SetState --> TurnOnRelay[開啟繼電器]
-    TurnOnRelay --> StartTimer[啟動計時器]
-    StartTimer --> PlaySound[播放下降音效]
-    PlaySound --> LoopStart[進入下降循環]
-    
-    LoopStart --> CheckLower{檢查下限位<br/>是否觸發?}
-    
-    CheckLower -->|是| Success[到達下限位]
-    Success --> TurnOffRelay1[關閉繼電器]
-    TurnOffRelay1 --> StopTimer1[停止計時器]
-    StopTimer1 --> SetIdle1[設定狀態<br/>→ IDLE/TEST]
-    SetIdle1 --> PlayComplete1[播放完成音效]
-    PlayComplete1 --> End1([下降完成])
-    
-    CheckLower -->|否| CheckTimeout{計時器<br/>是否超時?}
-    
-    CheckTimeout -->|是| Timeout[超時錯誤]
-    Timeout --> TurnOffRelay2[關閉繼電器]
-    TurnOffRelay2 --> StopTimer2[停止計時器]
-    StopTimer2 --> SetError[設定狀態<br/>→ ERROR]
-    SetError --> PlayError[播放錯誤音效]
-    PlayError --> End2([下降失敗])
-    
-    CheckTimeout -->|否| CheckIR{是否收到<br/>IR切換指令?}
-    
-    CheckIR -->|是| Cancel[取消下降]
-    Cancel --> TurnOffRelay3[關閉繼電器]
-    TurnOffRelay3 --> StopTimer3[停止計時器]
-    StopTimer3 --> Delay[短暫延遲<br/>100ms]
-    Delay --> SwitchUp[切換為上升]
-    SwitchUp --> End3([切換完成])
-    
-    CheckIR -->|否| LoopStart
-    
-    Reject --> End4([指令拒絕])
-    
-    style TurnOnRelay fill:#a5d6a7
-    style TurnOffRelay1 fill:#ef9a9a
-    style TurnOffRelay2 fill:#ef9a9a
-    style TurnOffRelay3 fill:#ef9a9a
-    style Success fill:#c8e6c9
-    style Timeout fill:#ffcdd2
-    style End1 fill:#c8e6c9
-    style End2 fill:#ffcdd2
+    style Up fill:#a5d6a7
+    style Down fill:#ef9a9a
 ```
 
-## 6. 自動上升觸發流程
+**三層過濾機制：**
+1. 空碼過濾（0x0000）
+2. 重複碼過濾（0xFFFF）
+3. 防彈跳過濾（800ms）
+
+---
+
+### 3. 上升/下降流程
 
 ```mermaid
 flowchart TD
-    Start([主循環]) --> CheckState{當前狀態<br/>是否為IDLE?}
+    Start([啟動動作]) --> RelayOn[開啟繼電器]
+    RelayOn --> Timer[啟動10秒計時]
+    Timer --> Loop[循環檢查]
     
-    CheckState -->|否| Skip1[跳過檢查]
-    CheckState -->|是| CheckAuto{自動模式<br/>是否開啟?}
+    Loop --> LimitOK{到達限位?}
+    LimitOK -->|是| Stop1[關繼電器→IDLE]
+    LimitOK -->|否| TimeoutCheck{超時?}
     
-    CheckAuto -->|否| Skip2[跳過檢查]
-    CheckAuto -->|是| CheckSpeed{速度是否<br/>≥ 15 km/h?}
+    TimeoutCheck -->|是| Stop2[關繼電器→ERROR]
+    TimeoutCheck -->|否| IRCheck{IR切換?}
     
-    CheckSpeed -->|否| Skip3[跳過檢查]
-    CheckSpeed -->|是| CheckPosition{是否在<br/>下限位?}
+    IRCheck -->|是| Switch[切換方向]
+    IRCheck -->|否| Loop
     
-    CheckPosition -->|否| Skip4[跳過檢查]
-    CheckPosition -->|是| Trigger[觸發自動上升]
-    
-    Trigger --> LogSpeed[記錄當前速度]
-    LogSpeed --> StartUp[執行上升動作]
-    StartUp --> End([自動上升啟動])
-    
-    Skip1 --> Continue([繼續主循環])
-    Skip2 --> Continue
-    Skip3 --> Continue
-    Skip4 --> Continue
+    style Stop1 fill:#c8e6c9
+    style Stop2 fill:#ffcdd2
+```
+
+**三種結束方式：**
+- ✅ 正常完成 - 觸發限位開關
+- ⚠️ 超時錯誤 - 10 秒未到達
+- 🔄 中途切換 - IR 改變方向
+
+---
+
+### 4. 自動上升觸發
+
+```mermaid
+flowchart TD
+    Check([檢查條件]) --> State{IDLE?}
+    State -->|否| Skip[跳過]
+    State -->|是| Auto{自動開?}
+    Auto -->|否| Skip
+    Auto -->|是| Speed{速度>=15?}
+    Speed -->|否| Skip
+    Speed -->|是| Pos{在下限?}
+    Pos -->|否| Skip
+    Pos -->|是| Trigger[觸發上升]
     
     style Trigger fill:#c8e6c9
-    style StartUp fill:#a5d6a7
-    style End fill:#c8e6c9
 ```
 
-## 7. 按鈕控制流程
+**四個必要條件：**
+1. ✅ 狀態 = IDLE
+2. ✅ 自動模式開啟
+3. ✅ 速度 ≥ 15 km/h
+4. ✅ 位於下限位
+
+---
+
+### 5. 錯誤處理流程
 
 ```mermaid
 flowchart TD
-    Start([讀取按鈕]) --> ReadState[讀取當前狀態]
+    Error([錯誤]) --> Stop[關繼電器]
+    Stop --> Lock[鎖定系統]
+    Lock --> Flash[紅燈閃爍]
+    Flash --> Wait[等待重啟]
     
-    ReadState --> CheckPress{按下瞬間?}
-    
-    CheckPress -->|是| RecordStart[記錄按下時間<br/>重置長按標記]
-    CheckPress -->|否| CheckHold{持續按住?}
-    
-    CheckHold -->|是| CheckDuration{按住時間<br/>≥ 2 秒?}
-    CheckDuration -->|是且未處理| LongPress[長按觸發]
-    CheckDuration -->|否| WaitMore[繼續等待]
-    CheckDuration -->|已處理| WaitRelease[等待放開]
-    
-    LongPress --> ToggleAuto[切換自動上升模式]
-    ToggleAuto --> CheckAutoState{自動模式<br/>新狀態?}
-    
-    CheckAutoState -->|開啟| PlayHigh[播放高音]
-    CheckAutoState -->|關閉| PlayLow[播放低音]
-    
-    PlayHigh --> LogAuto1[記錄: 自動模式開啟]
-    PlayLow --> LogAuto2[記錄: 自動模式關閉]
-    
-    LogAuto1 --> MarkHandled1[標記已處理]
-    LogAuto2 --> MarkHandled2[標記已處理]
-    
-    CheckHold -->|否| CheckRelease{放開瞬間?}
-    
-    CheckRelease -->|否| End1([按鈕處理完成])
-    CheckRelease -->|是| CalcDuration[計算按下時長]
-    
-    CalcDuration --> CheckShort{時長 < 2 秒?}
-    
-    CheckShort -->|是| ShortPress[短按觸發]
-    CheckShort -->|否| LongRelease[長按放開]
-    
-    ShortPress --> SwitchPage[切換OLED頁面]
-    SwitchPage --> PlayBeep[播放短音]
-    PlayBeep --> LogPage[記錄頁面切換]
-    
-    LogPage --> End2([按鈕處理完成])
-    LongRelease --> End3([按鈕處理完成])
-    RecordStart --> End4([按鈕處理完成])
-    WaitMore --> End5([按鈕處理完成])
-    WaitRelease --> End6([按鈕處理完成])
-    MarkHandled1 --> End7([按鈕處理完成])
-    MarkHandled2 --> End8([按鈕處理完成])
-    
-    style LongPress fill:#fff9c4
-    style ShortPress fill:#c8e6c9
-    style ToggleAuto fill:#ffe0b2
+    style Lock fill:#f44336
 ```
 
-## 8. 主循環結構
+**錯誤類型：**
+- 🔴 兩磁簧同時觸發
+- 🔴 動作超時 10 秒
+- 🔴 初始化失敗
 
-```mermaid
-flowchart TD
-    Start([Loop 開始]) --> ReadSensors[讀取所有感測器]
-    
-    ReadSensors --> UpdateSwitches[更新磁簧開關狀態]
-    UpdateSwitches --> UpdateSpeed[更新速度測量]
-    UpdateSpeed --> HandleInput[處理輸入]
-    
-    HandleInput --> HandleIR[處理 IR 指令]
-    HandleIR --> HandleButton[處理按鈕]
-    HandleButton --> CheckErrors[檢查異常狀態]
-    
-    CheckErrors --> CheckBothSwitches{兩磁簧<br/>同時觸發?}
-    
-    CheckBothSwitches -->|是| EmergencyStop[緊急停止<br/>→ ERROR]
-    CheckBothSwitches -->|否| StateMachine[狀態機處理]
-    
-    StateMachine --> CheckCurrentState{檢查當前狀態}
-    
-    CheckCurrentState -->|INIT| ProcessInit[執行初始化流程]
-    CheckCurrentState -->|IDLE| CheckAutoUp[檢查自動上升條件]
-    CheckCurrentState -->|TEST_MODE| CheckAutoUp
-    CheckCurrentState -->|MOVING_DOWN| ProcessDown[處理下降動作]
-    CheckCurrentState -->|MOVING_UP| ProcessUp[處理上升動作]
-    CheckCurrentState -->|ERROR| DoNothing[無動作<br/>等待重啟]
-    
-    ProcessInit --> UpdateOutputs[更新輸出]
-    CheckAutoUp --> UpdateOutputs
-    ProcessDown --> UpdateOutputs
-    ProcessUp --> UpdateOutputs
-    DoNothing --> UpdateOutputs
-    EmergencyStop --> UpdateOutputs
-    
-    UpdateOutputs --> UpdateRGB[更新 RGB LED]
-    UpdateRGB --> UpdateDisplay[更新 OLED 顯示]
-    UpdateDisplay --> PrintStatus[輸出狀態到串口]
-    
-    PrintStatus --> LoopEnd([Loop 結束])
-    LoopEnd --> Start
-    
-    style Start fill:#e1f5ff
-    style EmergencyStop fill:#ffcdd2
-    style UpdateOutputs fill:#c8e6c9
-    style LoopEnd fill:#e1f5ff
+---
+
+## 🔧 硬體配置
+
+### 腳位定義
+
+| 功能 | 腳位 | 說明 |
+|-----|------|------|
+| **繼電器** | Pin 22 | 馬達電源開關（高電平觸發） |
+| **蜂鳴器** | Pin 8 | 音效提示 |
+| **RGB 紅** | Pin 5 | 狀態指示燈 |
+| **RGB 綠** | Pin 6 | 狀態指示燈 |
+| **RGB 藍** | Pin 7 | 狀態指示燈 |
+| **上磁簧** | Pin 13 | 上限位開關（觸發=LOW） |
+| **下磁簧** | Pin 53 | 下限位開關（觸發=LOW） |
+| **霍爾感測** | Pin 2 | 速度測量（中斷） |
+| **IR 接收** | Pin 3 | 紅外線遙控 |
+| **按鈕** | Pin 12 | OLED 換頁 / 切換模式 |
+
+### 系統架構圖
+
+```
+┌─────────────────────────────────────────┐
+│           Arduino Mega 2560             │
+│  ┌─────────────────────────────────┐   │
+│  │     主控程式 (v10.1)            │   │
+│  │  • 狀態機管理                   │   │
+│  │  • 感測器讀取                   │   │
+│  │  • 安全保護                     │   │
+│  └─────────────────────────────────┘   │
+└────┬──────┬──────┬──────┬──────┬────────┘
+     │      │      │      │      │
+  ┌──▼──┐┌──▼──┐┌──▼──┐┌──▼──┐┌──▼──┐
+  │繼電器││OLED ││IR接 ││磁簧 ││霍爾 │
+  │控制 ││顯示 ││收器 ││開關 ││感測 │
+  └──┬──┘└─────┘└─────┘└─────┘└─────┘
+     │
+  ┌──▼────────────┐
+  │ 獨立 PWM 模組 │
+  └──┬────────────┘
+     │
+  ┌──▼────────────┐
+  │ 線性致動器    │
+  │ (旋轉型馬達) │
+  └───────────────┘
 ```
 
-## 9. 錯誤處理流程
+### 材料清單
 
-```mermaid
-flowchart TD
-    Start([偵測到錯誤]) --> CheckType{錯誤類型?}
-    
-    CheckType -->|兩磁簧同時觸發| Error1[BOTH_SWITCHES_ERROR]
-    CheckType -->|上升超時| Error2[TIMEOUT_ERROR]
-    CheckType -->|下降超時| Error3[TIMEOUT_ERROR]
-    CheckType -->|初始化超時| Error4[INIT_TIMEOUT_ERROR]
-    
-    Error1 --> CommonActions[共同處理]
-    Error2 --> CommonActions
-    Error3 --> CommonActions
-    Error4 --> CommonActions
-    
-    CommonActions --> StopRelay[關閉繼電器]
-    StopRelay --> StopTimer[停止計時器]
-    StopTimer --> SetErrorState[設定狀態<br/>→ ERROR_STATE]
-    SetErrorState --> RecordType[記錄錯誤類型]
-    RecordType --> PlayError[播放錯誤音效]
-    
-    PlayError --> LogError[輸出錯誤日誌]
-    LogError --> LockSystem[鎖定系統]
-    
-    LockSystem --> ErrorLoop[錯誤循環]
-    ErrorLoop --> FlashRed[紅色LED閃爍]
-    FlashRed --> ShowError[OLED顯示錯誤]
-    ShowError --> WaitReset{等待重啟}
-    
-    WaitReset -->|IR按下| IgnoreIR[忽略IR<br/>播放錯誤音]
-    WaitReset -->|按鈕按下| IgnoreButton[忽略按鈕]
-    WaitReset -->|系統重啟| SystemReset[系統重新啟動]
-    
-    IgnoreIR --> ErrorLoop
-    IgnoreButton --> ErrorLoop
-    SystemReset --> End([錯誤處理結束])
-    
-    style Error1 fill:#ffcdd2
-    style Error2 fill:#ffcdd2
-    style Error3 fill:#ffcdd2
-    style Error4 fill:#ffcdd2
-    style LockSystem fill:#f44336
-    style SystemReset fill:#c8e6c9
+| 項目 | 規格 | 數量 |
+|-----|------|------|
+| Arduino Mega 2560 | - | 1 |
+| 繼電器模組 | 5V 單路（高電平觸發） | 1 |
+| OLED 顯示器 | 128x64 I2C | 1 |
+| 線性致動器 | 12V 旋轉型 | 1 |
+| 獨立 PWM 模組 | - | 1 |
+| 磁簧開關 | 常開型 | 2 |
+| 霍爾感測器 | A3144 | 1 |
+| IR 接收器 | VS1838B | 1 |
+| RGB LED | 共陰極 | 1 |
+| 蜂鳴器 | 有源 5V | 1 |
+| 按鈕開關 | 6x6mm | 1 |
+
+---
+
+## 📥 安裝說明
+
+### 1. 安裝依賴庫
+
+在 Arduino IDE 中安裝以下函式庫：
+
+```cpp
+// 必要函式庫
+U8g2lib       // OLED 顯示
+IRremote      // 紅外線接收
+Wire          // I2C 通訊（內建）
 ```
 
-## 10. 速度測量流程
+**安裝步驟：**
+1. 開啟 Arduino IDE
+2. 工具 → 管理程式庫
+3. 搜尋並安裝：
+   - `U8g2` by olikraus
+   - `IRremote` by shirriff
 
-```mermaid
-flowchart TD
-    Start([霍爾感測器中斷]) --> ReadTime[讀取當前時間<br/>micros]
-    
-    ReadTime --> CalcInterval[計算脈衝間隔<br/>= 當前時間 - 上次時間]
-    
-    CalcInterval --> CheckMin{間隔是否<br/>≥ 40ms?}
-    
-    CheckMin -->|否| IgnorePulse[忽略脈衝<br/>防止雜訊]
-    CheckMin -->|是| ValidPulse[有效脈衝]
-    
-    ValidPulse --> SaveInterval[儲存脈衝間隔]
-    SaveInterval --> SaveTime[更新上次觸發時間]
-    SaveTime --> SetFlag[設定新數據標記]
-    
-    SetFlag --> EndInterrupt([中斷處理完成])
-    IgnorePulse --> EndInterrupt
-    
-    EndInterrupt -.-> MainLoop([主循環處理])
-    
-    MainLoop --> CheckFlag{是否有<br/>新數據?}
-    
-    CheckFlag -->|否| CheckTimeout{是否超時<br/>> 2 秒?}
-    CheckFlag -->|是| CalcSpeed[計算速度]
-    
-    CalcSpeed --> Formula[速度 = 周長 / 時間 × 3.6]
-    Formula --> Validate{速度是否<br/>合理?<br/>0~50 km/h}
-    
-    Validate -->|是| UpdateSpeed[更新當前速度]
-    Validate -->|否| DiscardSpeed[捨棄異常數據]
-    
-    UpdateSpeed --> ClearFlag[清除新數據標記]
-    ClearFlag --> MarkTime[標記更新時間]
-    
-    CheckTimeout -->|是| ZeroSpeed[速度歸零]
-    CheckTimeout -->|否| KeepSpeed[保持當前速度]
-    
-    MarkTime --> EndMain([速度處理完成])
-    DiscardSpeed --> EndMain
-    ZeroSpeed --> EndMain
-    KeepSpeed --> EndMain
-    
-    style ValidPulse fill:#c8e6c9
-    style IgnorePulse fill:#ffcdd2
-    style UpdateSpeed fill:#c8e6c9
-    style DiscardSpeed fill:#ffcdd2
+### 2. 上傳程式
+
+```bash
+# 1. 下載程式碼
+git clone https://github.com/your-username/training-wheel-v10.1.git
+
+# 2. 開啟 Arduino IDE
+# 3. 檔案 → 開啟 → training_wheel_v10.1_debug.ino
+# 4. 工具 → 板子 → Arduino Mega 2560
+# 5. 工具 → 序列埠 → 選擇正確的 COM Port
+# 6. 上傳
+```
+
+### 3. 接線檢查
+
+**重要提醒：**
+- ⚠️ 繼電器需獨立供電（避免 Arduino 電流不足）
+- ⚠️ 磁簧開關使用內建上拉（不需外接電阻）
+- ⚠️ 馬達電源與 Arduino 電源分離
+
+---
+
+## 🎮 使用方式
+
+### 基本操作
+
+#### 1. 啟動系統
+
+```
+上電 → 自動初始化（紫色閃爍）
+      ↓
+   找到基準位置
+      ↓
+   進入待機（青色燈）
+```
+
+#### 2. 手動控制
+
+| 情況 | 按 IR | 結果 |
+|-----|-------|------|
+| 在下限位 | 按一下 | ▲ 上升 |
+| 在上限位 | 按一下 | ▼ 下降 |
+| 上升中 | 按一下 | ▼ 改下降 |
+| 下降中 | 按一下 | ▲ 改上升 |
+
+#### 3. 自動上升模式
+
+```
+長按按鈕 2 秒 → 聽到高音
+                ↓
+           自動模式開啟（顯示 [AUTO]）
+                ↓
+           騎到 15 km/h → 自動收起
+                ↓
+           停車後按 IR → 放下輔助輪
+```
+
+#### 4. 按鈕功能
+
+- **短按**（< 2 秒）：切換 OLED 頁面（主頁 ⇄ 除錯頁）
+- **長按**（≥ 2 秒）：切換自動上升模式 ON/OFF
+
+---
+
+### OLED 顯示說明
+
+#### 主頁面
+
+```
+┌─────────────────────┐
+│ 輔助輪 v10.1  [AUTO]│ ← 自動模式指示
+├─────────────────────┤
+│ 待機                │ ← 當前狀態
+├─────────────────────┤
+│ Speed: 12 km/h      │ ← 即時速度
+│ UP:off  DN:ON       │ ← 磁簧狀態
+│ Relay:OFF           │ ← 繼電器狀態
+└─────────────────────┘
+```
+
+#### 除錯頁面
+
+```
+┌─────────────────────┐
+│ 除錯資訊            │
+├─────────────────────┤
+│ State: 1            │ ← 狀態編號
+│ Init Phase: 5       │ ← 初始化階段
+│ Motion Timer: 3s    │ ← 動作計時
+│ Error: 0            │ ← 錯誤碼
+│ Last IR: 0xFF30CF   │ ← IR 代碼
+└─────────────────────┘
 ```
 
 ---
 
-## 圖表說明
+### 測試模式
 
-### 顏色標示：
-- 🟦 **藍色**：啟動/開始節點
-- 🟩 **綠色**：成功/正常執行
-- 🟥 **紅色**：錯誤/失敗/停止
-- 🟨 **黃色**：警告/特殊狀態
-- 🟧 **橘色**：繼電器操作
+**啟動方式：** 按住按鈕 → 上電 → 聽到兩聲嗶嗶
 
-### 主要流程：
-1. **狀態機**：系統整體運作邏輯
-2. **初始化**：自動校正找基準位置
-3. **IR控制**：三層過濾機制
-4. **上升/下降**：包含超時保護
-5. **自動上升**：速度觸發條件
-6. **按鈕**：短按/長按不同功能
-7. **主循環**：每次循環的完整流程
-8. **錯誤處理**：異常情況處理
-9. **速度測量**：霍爾感測器中斷處理
+**功能：**
+- ✅ 跳過自動初始化
+- ✅ 直接進入手動控制
+- ✅ 黃色 LED 閃爍
+- ✅ 適合硬體測試
 
-### 關鍵保護機制：
-- ✅ 10秒超時保護
-- ✅ 磁簧防彈跳 50ms
-- ✅ IR防彈跳 800ms
-- ✅ 兩磁簧同時觸發偵測
-- ✅ 速度合理性檢查
-- ✅ 錯誤狀態鎖定
+**用途：**
+- 🔧 測試磁簧開關
+- 🔧 測試繼電器動作
+- 🔧 測試 IR 接收
+- 🔧 診斷硬體問題
+
+---
+
+## 🛡️ 安全機制
+
+### 三重保護系統
+
+#### 1. 超時保護（10 秒）
+
+```
+啟動動作 → 開始計時
+            ↓
+    10 秒內未觸發限位
+            ↓
+     自動關閉繼電器
+            ↓
+        進入錯誤狀態
+```
+
+#### 2. 限位保護
+
+```
+磁簧觸發 → 立即停止 → 關繼電器
+```
+
+**異常情況：**
+```
+兩磁簧同時觸發 → 緊急停止 → 錯誤狀態
+```
+
+#### 3. 錯誤鎖定
+
+```
+發生錯誤 → 關繼電器 → 鎖定系統 → 等待重啟
+```
+
+**錯誤狀態特徵：**
+- 🔴 紅色 LED 閃爍
+- 🔇 連續 3 聲警報
+- 🚫 拒絕所有控制指令
+- 🔒 需要重新上電
+
+---
+
+### 時間參數表
+
+| 保護項目 | 時間設定 | 說明 |
+|---------|---------|------|
+| **動作超時** | 10 秒 | 上升/下降未完成 |
+| **磁簧防彈跳** | 50 ms | 避免誤觸發 |
+| **IR 防彈跳** | 800 ms | 避免重複指令 |
+| **速度超時** | 2 秒 | 無脈衝自動歸零 |
+| **初始化延遲** | 500 ms | 到位後穩定時間 |
+
+---
+
+## ❓ 常見問題
+
+### Q1: 系統一直卡在初始化（紫色閃爍）？
+
+**可能原因：**
+- ❌ 磁簧開關接線錯誤
+- ❌ 磁鐵距離太遠
+- ❌ 機構卡住無法移動
+
+**解決方案：**
+```bash
+1. 檢查 Serial Monitor (115200 baud)
+2. 看是否顯示磁簧觸發訊息
+3. 手動移動機構測試磁簧
+4. 使用測試模式（按住按鈕啟動）
+```
+
+---
+
+### Q2: IR 遙控器沒反應？
+
+**診斷步驟：**
+
+1. **檢查 Serial Monitor**
+```
+[IR] 忽略: 空碼        ← 正常過濾
+[IR] 忽略: 重複碼      ← 正常過濾
+[IR] ✓ 接收有效信號    ← 應該看到這個
+```
+
+2. **檢查接線**
+- IR 接收器：VCC=5V, GND=GND, OUT=Pin 3
+- 確認 IR 接收器方向正確
+
+3. **測試其他遙控器**
+- 任何紅外線遙控器都能用
+- 不需要特定品牌
+
+---
+
+### Q3: 顯示 UP:1, DN:0 無法初始化？
+
+**問題：** 啟動時上磁簧就觸發了
+
+**可能原因：**
+- ❌ 磁鐵一直貼在上磁簧位置
+- ❌ Pin 13 接線短路
+- ❌ 磁簧極性接反
+
+**檢查方法：**
+```bash
+1. 打開 Serial Monitor
+2. 看啟動時的磁簧狀態
+3. 拔掉上磁簧接線
+4. 重新啟動，看是否變 UP:0
+```
+
+---
+
+### Q4: 按 IR 後馬達啟動又立刻停止？
+
+**可能原因：**
+- ❌ 已在限位位置（無法繼續移動）
+- ❌ 磁簧一直觸發
+- ❌ 繼電器供電不足
+
+**解決方案：**
+```
+查看 Serial Monitor 輸出：
+[限位保護] 強制停止於上限  ← 已在上限，應該按下降
+[限位保護] 強制停止於下限  ← 已在下限，應該按上升
+```
+
+---
+
+### Q5: 如何重置系統錯誤？
+
+**方法 1：** 重新上電（推薦）
+
+**方法 2：** 按 Arduino 的 RESET 按鈕
+
+**方法 3：** 重新上傳程式
+
+**注意：** 錯誤狀態下，IR 和按鈕都不會有反應
+
+---
+
+### Q6: 自動上升不觸發？
+
+**檢查清單：**
+
+```
+✅ 自動模式是否開啟？
+   → OLED 應顯示 [AUTO]
+   → 長按按鈕 2 秒開啟
+
+✅ 是否在下限位？
+   → OLED 應顯示 DN:ON
+
+✅ 速度是否 >= 15 km/h？
+   → OLED 顯示 Speed: XX
+
+✅ 當前狀態是否為 IDLE？
+   → 不能在錯誤或移動狀態
+```
+
+---
+
+## 📈 系統數據
+
+### 性能指標
+
+| 項目 | 數值 |
+|-----|------|
+| 響應時間 | < 100 ms |
+| 動作時間 | 約 5-8 秒 |
+| 超時保護 | 10 秒 |
+| 速度觸發 | 15 km/h |
+| 最高速度顯示 | 50 km/h |
+
+### 速度計算
+
+```cpp
+// 公式
+速度 (km/h) = (輪周長 (mm) / 脈衝間隔 (μs)) × 3.6
+
+// 範例
+輪周長 = 2042 mm (700C 輪胎)
+脈衝間隔 = 100000 μs (0.1秒)
+速度 = (2042 / 100000) × 3.6 = 73.5 km/h
+```
+
+---
+
+## 🎓 口試重點
+
+### 五個必問題目
+
+#### Q1: 為什麼需要初始化？
+**A:** 開機時系統不知道當前位置，必須透過磁簧開關找到基準點（下限位），才能確保後續動作的準確性。
+
+#### Q2: 如何防止機構卡住？
+**A:** 使用 10 秒超時保護機制，當動作啟動後若 10 秒內未觸發限位開關，系統會自動關閉繼電器並進入錯誤狀態，防止馬達持續運轉造成損壞。
+
+#### Q3: IR 為什麼需要三層過濾？
+**A:** 
+1. **第一層** - 空碼過濾（0x0000）：避免雜訊觸發
+2. **第二層** - 重複碼過濾（0xFFFF）：避免按住連續觸發
+3. **第三層** - 防彈跳過濾（800ms）：確保每次按下只執行一次
+
+#### Q4: 自動上升如何觸發？
+**A:** 需同時滿足 4 個條件：
+1. 系統狀態 = IDLE（待機）
+2. 自動模式已開啟
+3. 速度 ≥ 15 km/h
+4. 位於下限位
+
+#### Q5: 錯誤如何處理？
+**A:** 三步驟處理：
+1. 立即關閉繼電器（馬達斷電）
+2. 鎖定系統（拒絕所有指令）
+3. 等待重啟（需人工介入）
+
+---
+
+### 設計亮點
+
+1. **狀態機設計** - 清楚的狀態轉換，易於維護
+2. **多重保護** - 超時、限位、錯誤鎖定三重保護
+3. **功率分離** - Arduino 只控制繼電器，不直接驅動馬達
+4. **用戶回饋** - RGB、OLED、蜂鳴器三種即時回饋
+5. **診斷功能** - 測試模式、Serial 詳細日誌
+
+---
+
+## 📝 版本資訊
+
+### v10.1 (2026-01-08)
+- ✅ 完整中文註解
+- ✅ 增強診斷輸出
+- ✅ IR 三層過濾優化
+- ✅ 測試模式（按住按鈕啟動）
+- ✅ 詳細磁簧狀態監測
+
+### v10.0 (2026-01-07)
+- ✅ 初始版本
+- ✅ 基本功能實現
+- ✅ 繼電器控制架構
+- ✅ 移除 IMU 相關代碼
+
+---
+
+## 📜 授權
+
+本專題採用 MIT 授權條款。
+
+---
+
+## 👥 團隊成員
+
+- **林恩** - 木柵高工電子科
+- **指導老師** - XXX 老師
+
+---
+
+## 🙏 致謝
+
+感謝以下開源專案：
+- [U8g2](https://github.com/olikraus/u8g2) - OLED 顯示函式庫
+- [IRremote](https://github.com/Arduino-IRremote/Arduino-IRremote) - 紅外線接收函式庫
+- [Arduino](https://www.arduino.cc/) - 開發平台
+
+---
+
+## 📞 聯絡方式
+
+如有問題或建議，歡迎聯絡：
+- GitHub Issues: [提交問題](https://github.com/your-username/training-wheel-v10.1/issues)
+- Email: your-email@example.com
+
+---
+
+<div align="center">
+
+**⭐ 如果這個專題對你有幫助，請給個 Star！**
+
+Made with ❤️ by 木柵高工電子科
+
+</div>
