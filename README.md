@@ -100,9 +100,9 @@
 
 ---
 
-### 7. 系統流程圖
-```mermai
-stateDiagram-v2
+
+```mermaid
+flowchart TD
     [*] --> 上電啟動
     
     上電啟動 --> 檢查測試模式: 讀取按鈕
