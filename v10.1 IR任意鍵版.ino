@@ -27,7 +27,7 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 #define RGB_BLUE          7    // RGB 藍
 
 // 感測器輸入
-#define UPPER_SWITCH      13   // 上磁簧（內建上拉，觸發=LOW）
+#define UPPER_SWITCH      52   // 上磁簧（內建上拉，觸發=LOW）
 #define LOWER_SWITCH      53   // 下磁簧（內建上拉，觸發=LOW）
 #define HALL_SENSOR       2    // 霍爾速度感測（中斷腳）
 #define IR_RECEIVER       3    // 紅外線接收
