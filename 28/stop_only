@@ -1,0 +1,13 @@
+const uint8_t RELAY_PIN = 22;
+const uint8_t LIMIT_DOWN_PIN = 53;
+void setup() {
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(LIMIT_DOWN_PIN, INPUT_PULLUP);
+  digitalWrite(RELAY_PIN, HIGH);  // 啟動馬達
+}
+void loop() {
+  if (digitalRead(LIMIT_DOWN_PIN) == LOW) {
+    digitalWrite(RELAY_PIN, LOW); // 觸發下限 
+    while (1);                 
+  }
+}
