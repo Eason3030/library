@@ -1,0 +1,654 @@
+/*
+ * 智慧輔助輪系統 - 簡化版（順序切換 IR 控制）
+ * 
+ * 設計理念：
+ * - 繼電器 ON  = 輔助輪上升
+ * - 繼電器 OFF = 輔助輪下降（重力）
+ * - IR 遙控：任意按鍵順序切換（上升→下降→停止→上升...）
+ * 
+ * 功能：
+ * 1. 開機自動歸零（等待下降到底）
+ * 2. 速度 > 15km/h → 自動上升
+ * 3. 速度 < 15km/h → 自動下降
+ * 4. IR 任意鍵順序切換控制模式
+ * 5. 磁簧開關防呆
+ * 
+ * 硬體：
+ * - Arduino Mega 2560
+ * - DC 線性致動器
+ * - 繼電器模組
+ * - 霍爾速度感測器
+ * - 磁簧開關 x2
+ * - IR 遙控器（任意）
+ * - OLED SSD1306
+ * - RGB LED
+ * 
+ * 作者：林恩團隊
+ * 版本：v1.0
+ * 日期：2026/01/22
+ */
+
+#include <Wire.h>
+#include <IRremote.hpp>
+#include <U8g2lib.h>
+
+// ==================== 🎛️ 可調整參數 ====================
+
+// 【參數 1】速度閾值（km/h）
+const float SPEED_THRESHOLD = 15.0;
+
+// 【參數 2】輪胎周長（mm）- 實測你的腳踏車
+const float WHEEL_CIRCUMFERENCE = 2042.0;  // 700C 輪胎
+
+// 【參數 3】歸零超時（毫秒）
+const unsigned long HOMING_TIMEOUT = 20000;  // 20 秒
+
+// 【參數 4】磁簧去彈跳（毫秒）
+const unsigned long DEBOUNCE_DELAY = 50;
+
+// 【參數 5】馬達動作最小間隔（毫秒）
+const unsigned long MOTOR_CHANGE_DELAY = 1000;  // 1 秒
+
+// 【參數 6】速度平滑係數（0.0-1.0）
+const float SPEED_SMOOTH_ALPHA = 0.3;  // 越小越平滑
+
+// 【參數 7】IR 按鍵防抖延遲（毫秒）
+const unsigned long IR_DEBOUNCE = 300;  // 300ms
+
+// ==================== 🔌 硬體接腳定義 ====================
+
+// 馬達控制
+const uint8_t RELAY_PIN = 22;          // 繼電器（ON=上升, OFF=下降）
+
+// 感測器
+const uint8_t LIMIT_UP_PIN = 13;       // 上限磁簧（觸發=LOW）
+const uint8_t LIMIT_DOWN_PIN = 53;     // 下限磁簧（觸發=LOW）
+const uint8_t HALL_SPEED_PIN = 2;      // 霍爾感測（中斷腳）
+const uint8_t IR_RECEIVE_PIN = 3;      // IR 接收
+
+// 顯示與指示
+const uint8_t RGB_RED_PIN = 5;
+const uint8_t RGB_GREEN_PIN = 6;
+const uint8_t RGB_BLUE_PIN = 7;
+const uint8_t BUZZER_PIN = 8;
+
+// ==================== 🧩 系統狀態定義 ====================
+
+enum Priority {
+    P_MANUAL = 0,      // 手動控制（最高優先）
+    P_SPEED = 1,       // 速度觸發
+    P_IDLE = 2         // 閒置
+};
+
+enum IRMode {
+    IR_MODE_UP = 0,     // 上升模式
+    IR_MODE_DOWN = 1,   // 下降模式
+    IR_MODE_STOP = 2    // 停止模式（自動）
+};
+
+struct Command {
+    Priority priority;
+    bool wantUp;       // true=想上升, false=想下降
+    String reason;
+    
+    Command(Priority p, bool u, String r) 
+        : priority(p), wantUp(u), reason(r) {}
+    
+    Command() : priority(P_IDLE), wantUp(false), reason("待機") {}
+};
+
+// ==================== 🌐 全域物件與變數 ====================
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// 速度測量
+volatile unsigned long lastSpeedTrigger = 0;
+volatile unsigned long speedInterval = 0;
+float currentSpeed = 0;
+float smoothSpeed = 0;
+
+// 當前指令
+Command activeCommand;
+
+// 馬達狀態
+bool motorOn = false;
+unsigned long lastMotorChange = 0;
+
+// IR 遙控狀態
+IRMode currentIRMode = IR_MODE_STOP;  // 初始：停止模式（自動控制）
+unsigned long lastIRTime = 0;
+
+// 系統狀態
+bool systemReady = false;
+
+// ==================== ⚡ 速度測量（中斷） ====================
+
+void speedInterrupt() {
+    unsigned long now = micros();
+    speedInterval = now - lastSpeedTrigger;
+    lastSpeedTrigger = now;
+}
+
+// ==================== 📊 計算速度 ====================
+
+float calculateSpeed() {
+    // 2 秒沒觸發 = 靜止
+    if (micros() - lastSpeedTrigger > 2000000) {
+        smoothSpeed = 0;
+        return 0.0;
+    }
+    
+    if (speedInterval == 0) {
+        return 0.0;
+    }
+    
+    // 速度 (km/h) = (周長 mm / 時間 μs) × 3.6
+    float rawSpeed = (WHEEL_CIRCUMFERENCE / speedInterval) * 3.6;
+    
+    // 限制合理範圍
+    if (rawSpeed > 80.0 || rawSpeed < 0) {
+        rawSpeed = 0;
+    }
+    
+    // 平滑處理
+    smoothSpeed = SPEED_SMOOTH_ALPHA * rawSpeed + (1 - SPEED_SMOOTH_ALPHA) * smoothSpeed;
+    
+    return smoothSpeed;
+}
+
+// ==================== 🎮 IR 遙控（順序切換）====================
+
+Command checkManual() {
+    if (IrReceiver.decode()) {
+        // 取得任意按鍵碼
+        uint32_t code = IrReceiver.decodedIRData.decodedRawData;
+        
+        // 防抖：300ms 內不重複觸發
+        if (millis() - lastIRTime > IR_DEBOUNCE) {
+            // 忽略重複碼（按住不放）
+            if (code != 0xFFFFFFFF && code != 0) {
+                // 切換到下一個模式
+                currentIRMode = (IRMode)((currentIRMode + 1) % 3);
+                
+                // 視覺與聲音回饋
+                switch (currentIRMode) {
+                    case IR_MODE_UP:
+                        Serial.println("IR: 切換到【上升】模式");
+                        beep(1500, 100);  // 高音短嗶
+                        setRGB(0, 0, 255); // 藍燈
+                        break;
+                        
+                    case IR_MODE_DOWN:
+                        Serial.println("IR: 切換到【下降】模式");
+                        beep(1000, 100);  // 中音短嗶
+                        setRGB(255, 255, 0); // 黃燈
+                        break;
+                        
+                    case IR_MODE_STOP:
+                        Serial.println("IR: 切換到【自動】模式");
+                        beep(500, 200);   // 低音長嗶
+                        setRGB(0, 255, 0); // 綠燈
+                        break;
+                }
+                
+                lastIRTime = millis();
+            }
+        }
+        
+        IrReceiver.resume();
+    }
+    
+    // 根據當前模式回傳指令
+    switch (currentIRMode) {
+        case IR_MODE_UP:
+            return Command(P_MANUAL, true, "IR手動-上升");
+            
+        case IR_MODE_DOWN:
+            return Command(P_MANUAL, false, "IR手動-下降");
+            
+        case IR_MODE_STOP:
+        default:
+            return Command();  // IDLE（交給速度控制）
+    }
+}
+
+// ==================== 🏃 速度判斷 ====================
+
+Command checkSpeed() {
+    if (currentSpeed > SPEED_THRESHOLD) {
+        return Command(P_SPEED, true, "速度快-上升");
+    } else {
+        return Command(P_SPEED, false, "速度慢-下降");
+    }
+}
+
+// ==================== 🎨 RGB 控制 ====================
+
+void setRGB(uint8_t r, uint8_t g, uint8_t b) {
+    analogWrite(RGB_RED_PIN, r);
+    analogWrite(RGB_GREEN_PIN, g);
+    analogWrite(RGB_BLUE_PIN, b);
+}
+
+// ==================== 🔊 蜂鳴器 ====================
+
+void beep(int freq, int duration) {
+    tone(BUZZER_PIN, freq, duration);
+}
+
+// ==================== 🖥️ OLED 顯示 ====================
+
+void updateDisplay() {
+    u8g2.clearBuffer();
+    
+    // === 第一行：標題 ===
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(0, 10, "Training Wheel v1.0");
+    
+    // === 第二行：IR 模式 ===
+    u8g2.setFont(u8g2_font_6x10_tr);
+    String modeStr = "IR: ";
+    switch (currentIRMode) {
+        case IR_MODE_UP:   modeStr += "UP"; break;
+        case IR_MODE_DOWN: modeStr += "DOWN"; break;
+        case IR_MODE_STOP: modeStr += "AUTO"; break;
+    }
+    u8g2.drawStr(0, 25, modeStr.c_str());
+    
+    // === 第三行：當前指令 ===
+    String cmdStr = activeCommand.reason;
+    u8g2.drawStr(0, 38, cmdStr.c_str());
+    
+    // === 第四行：速度 ===
+    String speedStr = "Spd:" + String(currentSpeed, 1) + " km/h";
+    u8g2.drawStr(0, 51, speedStr.c_str());
+    
+    // === 第五行：磁簧與馬達狀態 ===
+    bool atTop = (digitalRead(LIMIT_UP_PIN) == LOW);
+    bool atBottom = (digitalRead(LIMIT_DOWN_PIN) == LOW);
+    
+    String statusStr = "";
+    if (atTop) statusStr += "TOP ";
+    if (atBottom) statusStr += "BTM ";
+    if (!atTop && !atBottom) statusStr += "MID ";
+    statusStr += motorOn ? "[ON]" : "[OFF]";
+    
+    u8g2.drawStr(0, 64, statusStr.c_str());
+    
+    u8g2.sendBuffer();
+}
+
+// ==================== 🚗 馬達控制 ====================
+
+void setMotor(bool on) {
+    // 檢查 1: 狀態相同 → 不動作
+    if (on == motorOn) {
+        return;
+    }
+    
+    // 檢查 2: 防止頻繁切換
+    if (millis() - lastMotorChange < MOTOR_CHANGE_DELAY) {
+        return;
+    }
+    
+    // 執行改變
+    motorOn = on;
+    lastMotorChange = millis();
+    digitalWrite(RELAY_PIN, on ? HIGH : LOW);
+    
+    // RGB 指示（只在非手動模式才改變顏色）
+    if (currentIRMode == IR_MODE_STOP) {
+        if (on) {
+            setRGB(0, 0, 255);  // 藍色 = 上升
+        } else {
+            setRGB(255, 255, 0);  // 黃色 = 下降
+        }
+    }
+    
+    Serial.print("馬達: ");
+    Serial.println(on ? "ON (上升)" : "OFF (下降)");
+}
+
+void stopMotor() {
+    setMotor(false);
+    if (currentIRMode == IR_MODE_STOP) {
+        setRGB(0, 255, 0);  // 綠色 = 停止（自動模式）
+    }
+}
+
+// ==================== 🎯 執行指令 ====================
+
+void executeCommand(Command cmd) {
+    // 讀取磁簧狀態
+    bool atTop = (digitalRead(LIMIT_UP_PIN) == LOW);
+    bool atBottom = (digitalRead(LIMIT_DOWN_PIN) == LOW);
+    
+    // 防呆 1：已在上限 + 想上升 → 停止
+    if (atTop && cmd.wantUp) {
+        Serial.println("⚠️ 已在上限，禁止上升");
+        stopMotor();
+        return;
+    }
+    
+    // 防呆 2：已在下限 + 想下降 → 停止
+    if (atBottom && !cmd.wantUp) {
+        Serial.println("⚠️ 已在下限，禁止下降");
+        stopMotor();
+        return;
+    }
+    
+    // 閒置狀態 → 停止
+    if (cmd.priority == P_IDLE) {
+        stopMotor();
+        return;
+    }
+    
+    // 執行動作
+    if (cmd.wantUp) {
+        setMotor(true);   // 繼電器 ON = 上升
+    } else {
+        setMotor(false);  // 繼電器 OFF = 下降
+    }
+}
+
+// ==================== 🏁 自動歸零 ====================
+
+void autoHoming() {
+    Serial.println("\n========== 開始歸零 ==========");
+    
+    // 顯示訊息
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(0, 25, "Homing...");
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.drawStr(0, 40, "Waiting down limit");
+    u8g2.sendBuffer();
+    
+    // 確保繼電器關閉（讓輔助輪自然下降）
+    digitalWrite(RELAY_PIN, LOW);
+    motorOn = false;
+    
+    unsigned long startTime = millis();
+    bool ledState = false;
+    
+    // 等待下限觸發
+    while (digitalRead(LIMIT_DOWN_PIN) == HIGH) {
+        // 超時檢查
+        if (millis() - startTime > HOMING_TIMEOUT) {
+            Serial.println("❌ 歸零超時！");
+            u8g2.clearBuffer();
+            u8g2.setFont(u8g2_font_ncenB08_tr);
+            u8g2.drawStr(0, 30, "ERROR:");
+            u8g2.drawStr(0, 45, "Homing timeout!");
+            u8g2.sendBuffer();
+            
+            // 錯誤提示
+            for (int i = 0; i < 5; i++) {
+                setRGB(255, 0, 0);
+                beep(1000, 200);
+                delay(200);
+                setRGB(0, 0, 0);
+                delay(200);
+            }
+            
+            while(1);  // 停止系統
+        }
+        
+        // RGB 紅燈閃爍
+        ledState = !ledState;
+        setRGB(ledState ? 255 : 0, 0, 0);
+        delay(100);
+    }
+    
+    // 歸零成功
+    Serial.println("✓ 歸零完成！");
+    beep(1500, 200);
+    setRGB(0, 255, 0);  // 綠燈
+    
+    // 顯示就緒
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(0, 30, "System Ready!");
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.drawStr(0, 50, "Press IR to switch");
+    u8g2.sendBuffer();
+    
+    delay(2000);
+    systemReady = true;
+}
+
+// ==================== 🖨️ Debug 輸出 ====================
+
+void printDebug() {
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint < 1000) return;  // 每秒印一次
+    lastPrint = millis();
+    
+    Serial.println("===== DEBUG =====");
+    Serial.print("IR Mode: ");
+    switch (currentIRMode) {
+        case IR_MODE_UP:   Serial.println("UP"); break;
+        case IR_MODE_DOWN: Serial.println("DOWN"); break;
+        case IR_MODE_STOP: Serial.println("AUTO"); break;
+    }
+    Serial.print("Priority: "); Serial.println(activeCommand.priority);
+    Serial.print("Reason: "); Serial.println(activeCommand.reason);
+    Serial.print("WantUp: "); Serial.println(activeCommand.wantUp ? "YES" : "NO");
+    Serial.print("Speed: "); Serial.print(currentSpeed); Serial.println(" km/h");
+    Serial.print("Motor: "); Serial.println(motorOn ? "ON" : "OFF");
+    Serial.print("LimitUp: "); Serial.println(digitalRead(LIMIT_UP_PIN) == LOW ? "觸發" : "未觸發");
+    Serial.print("LimitDown: "); Serial.println(digitalRead(LIMIT_DOWN_PIN) == LOW ? "觸發" : "未觸發");
+    Serial.println("=================\n");
+}
+
+// ==================== ⚙️ Setup ====================
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("\n======================================");
+    Serial.println("  智慧輔助輪系統 v1.0");
+    Serial.println("  IR 控制：任意鍵順序切換");
+    Serial.println("======================================\n");
+    
+    // 1. 初始化 I2C
+    Wire.begin();
+    
+    // 2. 初始化 OLED
+    u8g2.begin();
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(0, 30, "Initializing...");
+    u8g2.sendBuffer();
+    delay(500);
+    
+    // 3. 初始化 IR 接收
+    IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
+    Serial.println("✓ IR 接收器就緒");
+    Serial.println("  按任意鍵可切換模式：");
+    Serial.println("  第1次 → 上升");
+    Serial.println("  第2次 → 下降");
+    Serial.println("  第3次 → 自動");
+    Serial.println("  第4次 → 上升（循環）\n");
+    
+    // 4. 初始化腳位
+    pinMode(RELAY_PIN, OUTPUT);
+    pinMode(LIMIT_UP_PIN, INPUT_PULLUP);
+    pinMode(LIMIT_DOWN_PIN, INPUT_PULLUP);
+    pinMode(RGB_RED_PIN, OUTPUT);
+    pinMode(RGB_GREEN_PIN, OUTPUT);
+    pinMode(RGB_BLUE_PIN, OUTPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+    
+    // 5. 確保馬達關閉
+    digitalWrite(RELAY_PIN, LOW);
+    motorOn = false;
+    
+    // 6. 初始化速度中斷
+    attachInterrupt(digitalPinToInterrupt(HALL_SPEED_PIN), speedInterrupt, FALLING);
+    Serial.println("✓ 霍爾感測器就緒");
+    
+    // 7. 開機音
+    beep(1000, 100);
+    delay(100);
+    beep(1500, 100);
+    delay(500);
+    
+    // 8. 自動歸零
+    autoHoming();
+    
+    Serial.println("\n========== 系統就緒 ==========");
+    Serial.println("開始主循環...\n");
+}
+
+// ==================== 🔄 Loop ====================
+
+void loop() {
+    // 1. 更新速度
+    currentSpeed = calculateSpeed();
+    
+    // 2. 收集指令
+    Command manual = checkManual();   // IR 遙控
+    Command speed = checkSpeed();     // 速度判斷
+    
+    // 3. 選出優先權最高的指令
+    if (manual.priority < speed.priority) {
+        activeCommand = manual;
+    } else {
+        activeCommand = speed;
+    }
+    
+    // 4. 執行指令
+    executeCommand(activeCommand);
+    
+    // 5. 更新顯示
+    updateDisplay();
+    
+    // 6. Debug 輸出（可註解掉）
+    // printDebug();
+    
+    // 7. 延遲
+    delay(50);  // 20Hz 更新頻率
+}
+```
+
+---
+
+## 🎯 程式運作邏輯說明
+
+### IR 控制邏輯
+```
+開機預設：IR_MODE_STOP（自動模式，綠燈）
+         ↓
+按任意 IR 鍵
+         ↓
+IR_MODE_UP（上升模式，藍燈，高音嗶）
+         ↓
+再按一次
+         ↓
+IR_MODE_DOWN（下降模式，黃燈，中音嗶）
+         ↓
+再按一次
+         ↓
+IR_MODE_STOP（自動模式，綠燈，低音長嗶）
+         ↓
+再按一次 → 回到 IR_MODE_UP（循環）
+```
+
+### 優先權邏輯
+```
+每個 loop 循環：
+
+1. 收集兩個指令：
+   - manual = checkManual()  // IR 控制
+   - speed = checkSpeed()    // 速度判斷
+
+2. 比較優先權：
+   if (manual.priority < speed.priority):
+      activeCommand = manual  // IR 優先
+   else:
+      activeCommand = speed   // 速度控制
+
+3. 執行 activeCommand
+
+範例情境：
+├─ IR 在「自動」模式 → manual = {P_IDLE, ...}
+│  speed = {P_SPEED, ...} → speed 優先（速度控制）
+│
+├─ IR 在「上升」模式 → manual = {P_MANUAL, UP, ...}
+│  speed = {P_SPEED, DOWN, ...} → manual 優先（IR 控制）
+│
+└─ IR 在「下降」模式 → manual = {P_MANUAL, DOWN, ...}
+   到達下限 → executeCommand() 防呆停止
+```
+
+---
+
+## 🎮 使用說明
+
+### 開機流程
+```
+1. 上傳程式
+2. 打開 Serial Monitor (115200)
+3. 看到：
+   ======================================
+     智慧輔助輪系統 v1.0
+     IR 控制：任意鍵順序切換
+   ======================================
+   
+4. 系統自動歸零：
+   ========== 開始歸零 ==========
+   （輔助輪自然下降，紅燈閃爍）
+   ✓ 歸零完成！
+   ========== 系統就緒 ==========
+   
+5. OLED 顯示「System Ready!」
+6. 進入主循環
+```
+
+### 日常操作
+```
+【自動模式】（預設）
+- 速度 > 15 km/h → 自動上升
+- 速度 < 15 km/h → 自動下降
+- RGB 綠燈
+
+【手動上升】
+- 按一次 IR 遙控器任意鍵
+- 蜂鳴器：嗶（高音）
+- RGB 藍燈
+- 持續上升（直到按下一次）
+
+【手動下降】
+- 再按一次 IR
+- 蜂鳴器：嗶（中音）
+- RGB 黃燈
+- 持續下降（直到按下一次）
+
+【回到自動】
+- 再按一次 IR
+- 蜂鳴器：嗶嗶（低音長）
+- RGB 綠燈
+- 回到速度自動控制
+```
+
+---
+
+## 📺 OLED 顯示內容
+```
+┌────────────────────────┐
+│ Training Wheel v1.0    │ ← 標題
+│ IR: AUTO               │ ← 當前 IR 模式（AUTO/UP/DOWN）
+│ 速度快-上升             │ ← 當前指令原因
+│ Spd:18.5 km/h          │ ← 速度
+│ MID [ON]               │ ← 磁簧狀態 + 馬達狀態
+└────────────────────────┘
+
+磁簧狀態顯示：
+- TOP     = 在上限位
+- BTM     = 在下限位
+- MID     = 在中間
+- TOP BTM = 兩個都觸發（異常）
+
+馬達狀態：
+- [ON]  = 繼電器通電（上升中）
+- [OFF] = 繼電器斷電（下降或停止）
