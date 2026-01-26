@@ -1,0 +1,355 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <IRremote.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+const byte BUZZER_PIN = 8;
+const byte IR_PIN = 3;
+const byte RELAY_PIN = 4;
+const byte LIMIT_UP = 52;
+const byte LIMIT_DOWN = 53;
+const byte RGB_RED = 5;
+const byte RGB_GREEN = 7;
+const byte RGB_BLUE = 6;
+const byte HALL_PIN = 2;
+
+#define NOTE_C4  262
+#define NOTE_E4  330
+#define NOTE_G4  392
+#define NOTE_C5  523
+
+// 速度計算參數
+#define WHEEL_CIRCUMFERENCE 2.0
+volatile unsigned long pulseCount = 0;
+volatile unsigned long lastPulseTime = 0;
+unsigned long lastSpeedCalc = 0;
+unsigned long lastDisplayUpdate = 0;
+float currentSpeed = 0.0;
+
+// MPU6500 設定
+#define MPU_ADDR 0x68
+#define PWR_MGMT_1 0x6B
+#define ACCEL_XOUT_H 0x3B
+
+bool justStarted = false;
+bool isIdle = true;
+bool autoRaising = false;
+bool tiltProtection = false;  // 傾角保護狀態
+unsigned long lastRainbow = 0;
+int rainbowStep = 0;
+
+float tiltAngle = 0.0;
+unsigned long lastIMURead = 0;
+
+// 霍爾感測器中斷函式
+void hallInterrupt() {
+  unsigned long currentTime = micros();
+  if (currentTime - lastPulseTime > 50000) {
+    pulseCount++;
+    lastPulseTime = currentTime;
+  }
+}
+
+void setRGB(byte r, byte g, byte b) {
+  analogWrite(RGB_RED, r);
+  analogWrite(RGB_GREEN, g);
+  analogWrite(RGB_BLUE, b);
+}
+
+void playTone(uint16_t frequency, uint16_t durationMs) {
+  tone(BUZZER_PIN, frequency, durationMs);
+  delay(durationMs + 20);
+  noTone(BUZZER_PIN);
+}
+
+void rainbowEffect() {
+  switch(rainbowStep) {
+    case 0: setRGB(255, 0, 0); break;
+    case 1: setRGB(255, 255, 0); break;
+    case 2: setRGB(0, 255, 0); break;
+    case 3: setRGB(0, 255, 255); break;
+    case 4: setRGB(0, 0, 255); break;
+    case 5: setRGB(255, 0, 255); break;
+  }
+  rainbowStep = (rainbowStep + 1) % 6;
+}
+
+void updateDisplay() {
+  if (millis() - lastDisplayUpdate < 300) return;
+  lastDisplayUpdate = millis();
+  
+  display.clearDisplay();
+  
+  // 第一行: 速度(大字)
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print(currentSpeed, 1);
+  display.print(" km/h");
+  
+  // 第二行: 角度
+  display.setCursor(0, 20);
+  display.print("Angle:");
+  display.print(tiltAngle, 1);
+  display.print((char)247);  // 度數符號
+  
+  // 第三行: 狀態
+  display.setTextSize(1);
+  display.setCursor(0, 40);
+  if (tiltProtection) {
+    display.print("TILT PROTECT!");
+  } else if (autoRaising) {
+    display.print("AUTO RAISING");
+  } else if (isIdle) {
+    display.print("IDLE");
+  } else {
+    display.print("MANUAL CTRL");
+  }
+  
+  // 脈衝數(除錯)
+  display.setCursor(0, 55);
+  display.print("Pulse:");
+  display.print(pulseCount);
+  
+  display.display();
+}
+
+bool initMPU6500() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(PWR_MGMT_1);
+  Wire.write(0x00);
+  byte error = Wire.endTransmission();
+  
+  if (error == 0) {
+    Serial.println("MPU6500 初始化成功");
+    return true;
+  } else {
+    Serial.print("MPU6500 初始化失敗,錯誤碼:");
+    Serial.println(error);
+    return false;
+  }
+}
+
+void readMPU6500() {
+  if (millis() - lastIMURead < 200) return;
+  lastIMURead = millis();
+  
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(ACCEL_XOUT_H);
+  byte error = Wire.endTransmission(false);
+  
+  if (error != 0) return;
+  
+  Wire.requestFrom((byte)MPU_ADDR, (byte)6);
+  
+  if (Wire.available() >= 6) {
+    int16_t accelX = (Wire.read() << 8) | Wire.read();
+    int16_t accelY = (Wire.read() << 8) | Wire.read();
+    int16_t accelZ = (Wire.read() << 8) | Wire.read();
+    
+    float ax = accelX / 16384.0;
+    float az = accelZ / 16384.0;
+    tiltAngle = atan2(ax, az) * 57.2958;
+    
+    Serial.print("角度: ");
+    Serial.print(tiltAngle, 1);
+    Serial.println("°");
+  }
+}
+
+void calculateSpeed() {
+  if (millis() - lastSpeedCalc < 1000) return;
+  
+  unsigned long elapsed = millis() - lastSpeedCalc;
+  
+  // 繼電器運轉時忽略速度
+  if (digitalRead(RELAY_PIN) == HIGH) {
+    pulseCount = 0;
+    currentSpeed = 0.0;
+    lastSpeedCalc = millis();
+    return;
+  }
+  
+  if (pulseCount > 0) {
+    float distance = pulseCount * WHEEL_CIRCUMFERENCE;
+    float speed = (distance / elapsed) * 1000.0 * 3.6;
+    
+    if (speed <= 60.0) {
+      currentSpeed = speed;
+      Serial.print("✓ 速度: ");
+      Serial.print(currentSpeed, 1);
+      Serial.print(" km/h (脈衝:");
+      Serial.print(pulseCount);
+      Serial.println(")");
+    } else {
+      Serial.print("✗ 異常速度: ");
+      Serial.print(speed);
+      Serial.print(" (脈衝:");
+      Serial.print(pulseCount);
+      Serial.println(")");
+      currentSpeed = 0.0;
+    }
+    
+    pulseCount = 0;
+  } else {
+    currentSpeed = 0.0;
+    Serial.println("速度: 0.0 km/h");
+  }
+  
+  lastSpeedCalc = millis();
+}
+
+void checkTiltProtection() {
+  // 角度 > 15 度,啟動傾角保護
+  if (abs(tiltAngle) > 15.0 && !tiltProtection) {
+    // 檢查是否已經在下限
+    if (digitalRead(LIMIT_DOWN) == HIGH) {
+      tiltProtection = true;
+      autoRaising = false;  // 取消自動升起
+      digitalWrite(RELAY_PIN, HIGH);  // 反向運轉,放下致動器
+      isIdle = false;
+      setRGB(255, 0, 0);  // 紅燈警告
+      playTone(NOTE_C4, 100);
+      delay(50);
+      playTone(NOTE_C4, 100);
+      Serial.println("⚠ 傾角保護啟動!");
+    }
+  }
+  
+  // 到達下限,停止傾角保護
+  if (tiltProtection && digitalRead(LIMIT_DOWN) == LOW) {
+    digitalWrite(RELAY_PIN, LOW);
+    tiltProtection = false;
+    isIdle = true;
+    setRGB(0, 255, 0);
+    playTone(NOTE_G4, 300);
+    Serial.println("✓ 傾角保護完成,已放下");
+  }
+}
+
+void checkAutoRaise() {
+  // 速度達標且無傾角保護時才自動升起
+  if (currentSpeed >= 15.0 && !autoRaising && !tiltProtection) {
+    if (digitalRead(LIMIT_UP) == HIGH) {
+      autoRaising = true;
+      digitalWrite(RELAY_PIN, HIGH);
+      isIdle = false;
+      setRGB(0, 255, 0);
+      playTone(NOTE_G4, 200);
+      Serial.println("自動升起:速度達標");
+    }
+  }
+  
+  if (autoRaising && digitalRead(LIMIT_UP) == LOW) {
+    digitalWrite(RELAY_PIN, LOW);
+    autoRaising = false;
+    setRGB(0, 0, 255);
+    playTone(NOTE_C5, 200);
+    Serial.println("自動升起完成");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(LIMIT_UP, INPUT_PULLUP);
+  pinMode(LIMIT_DOWN, INPUT_PULLUP);
+  pinMode(HALL_PIN, INPUT_PULLUP);
+  pinMode(RGB_RED, OUTPUT);
+  pinMode(RGB_GREEN, OUTPUT);
+  pinMode(RGB_BLUE, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  
+  digitalWrite(RELAY_PIN, LOW);
+  
+  playTone(NOTE_C4, 150);
+  playTone(NOTE_E4, 150);
+  playTone(NOTE_G4, 150);
+  playTone(NOTE_C5, 300);
+  
+  Wire.begin();
+  Wire.setClock(400000);
+  
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(10, 20);
+    display.println("BIKE");
+    display.setCursor(10, 40);
+    display.println("ASSIST");
+    display.display();
+    Serial.println("OLED 啟動成功");
+    delay(2000);
+  }
+  
+  initMPU6500();
+  IrReceiver.begin(IR_PIN, ENABLE_LED_FEEDBACK);
+  attachInterrupt(digitalPinToInterrupt(HALL_PIN), hallInterrupt, FALLING);
+  
+  Serial.println("系統啟動完成");
+  Serial.println("功能: 速度測量 / 自動升起 / 傾角保護");
+}
+
+void loop() {
+  readMPU6500();
+  calculateSpeed();
+  checkTiltProtection();  // 先檢查傾角保護
+  checkAutoRaise();
+  updateDisplay();
+  
+  if (isIdle && millis() - lastRainbow > 500) {
+    rainbowEffect();
+    lastRainbow = millis();
+  }
+  
+  // 磁簧偵測(只在非傾角保護時)
+  if (!justStarted && !autoRaising && !tiltProtection) {
+    if (digitalRead(LIMIT_DOWN) == LOW) {
+      digitalWrite(RELAY_PIN, LOW);
+      isIdle = false;
+      setRGB(255, 0, 0);
+      Serial.println("下限!");
+    }
+    
+    if (digitalRead(LIMIT_UP) == LOW) {
+      digitalWrite(RELAY_PIN, LOW);
+      isIdle = false;
+      setRGB(0, 0, 255);
+      Serial.println("上限!");
+    }
+  }
+  
+  // IR 控制
+  if (IrReceiver.decode()) {
+    uint32_t cmd = IrReceiver.decodedIRData.decodedRawData;
+    
+    if (cmd == 0xB946FF00) {
+      // 手動上升時取消所有自動模式
+      autoRaising = false;
+      tiltProtection = false;
+      digitalWrite(RELAY_PIN, HIGH);
+      isIdle = false;
+      setRGB(255, 255, 0);
+      justStarted = true;
+      Serial.println("IR:上鍵");
+      delay(500);
+      justStarted = false;
+    }
+    else if (cmd == 0xEA15FF00) {
+      autoRaising = false;
+      tiltProtection = false;
+      digitalWrite(RELAY_PIN, LOW);
+      isIdle = true;
+      Serial.println("IR:下鍵");
+    }
+    
+    IrReceiver.resume();
+  }
+}
